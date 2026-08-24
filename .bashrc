@@ -799,7 +799,53 @@ clean_claude() {
       "$input" > "$output"
 }
 
+#── FZF & Friends ────────────────────────────────────────────────
 
+install_fzf_tools() {
+    echo "=== Installing eza, bat, fd, fzf, ripgrep ==="
+
+    if command -v apt &>/dev/null; then
+        sudo apt update
+        sudo apt install -y eza bat fd-find fzf ripgrep
+
+        # Debian/Ubuntu ship these under different binary names
+        mkdir -p ~/.local/bin
+        [ -x /usr/bin/batcat ] && [ ! -e ~/.local/bin/bat ] && ln -s "$(command -v batcat)" ~/.local/bin/bat
+        [ -x /usr/bin/fdfind ] && [ ! -e ~/.local/bin/fd ] && ln -s "$(command -v fdfind)" ~/.local/bin/fd
+
+    elif command -v dnf &>/dev/null; then
+        sudo dnf install -y eza bat fd-find fzf ripgrep
+
+    elif command -v pacman &>/dev/null; then
+        sudo pacman -Sy --needed eza bat fd fzf ripgrep
+
+    elif command -v apk &>/dev/null; then
+        sudo apk add eza bat fd fzf ripgrep
+
+    elif command -v brew &>/dev/null; then
+        brew install eza bat fd fzf ripgrep
+
+    else
+        echo "✗ No supported package manager found (apt/dnf/pacman/apk/brew)"
+        echo "  Falling back to fzf git install..."
+        git clone --depth 1 https://github.com/junegunn/fzf.git ~/.fzf
+        ~/.fzf/install --all
+        return
+    fi
+
+    echo "✓ Done. Restart your shell or run 'reload'."
+}
+
+fzf-open-widget() {
+    local file
+    file=$(fzf --height 60% --layout=reverse --preview \
+        'command -v bat &>/dev/null && bat --style=numbers --color=always --line-range :200 {} || cat {}' < /dev/tty)
+    if [[ -n "$file" ]]; then
+        READLINE_LINE="${EDITOR:-nvim} \"$file\""
+        READLINE_POINT=${#READLINE_LINE}
+    fi
+}
+bind -x '"\C-f": fzf-open-widget'
 
 #── APPS ────────────────────────────────────────────────
 
