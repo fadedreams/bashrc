@@ -1,13 +1,9 @@
-#── ble.sh (must be sourced first, before anything else) ──────────
-# https://github.com/akinomyoga/ble.sh
-[[ $- == *i* ]] && [ -r ~/.local/share/blesh/ble.sh ] && source ~/.local/share/blesh/ble.sh --attach=none
-
 #── Aliases ────────────────────────────────────────────────
 
 alias v="nvim"
 alias py="python3"
 alias docker-compose="docker compose"
-alias reload='source ~/.bashrc'
+alias reload='source ~/.zshrc'
 alias c='clear'
 alias ssh='TERM=xterm-256color ssh'
 
@@ -89,30 +85,13 @@ git_test() {
 
 alias tree="command tree -I 'node_modules|dist|.git|.next|.gitignore|.DS_Store|.env|.env.local|.cache|.vscode|.idea|coverage|build|out|tmp|.turbo|.eslintcache'"
 
-# eza / bat / fd aware overrides (only apply if the tools are installed)
-if command -v eza &>/dev/null; then
-    alias ls='eza --color=auto --group-directories-first'
-    alias ll='eza -lah --group-directories-first'
-    alias la='eza -a --group-directories-first'
-    alias l='eza -F --group-directories-first'
-    alias tree='eza --tree -I "node_modules|dist|.git|.next|.cache|.vscode|.idea|coverage|build|out|tmp|.turbo|.eslintcache"'
-fi
-
-if command -v bat &>/dev/null; then
-    alias cat='bat --paging=never'
-elif command -v batcat &>/dev/null; then
-    alias bat='batcat'
-    alias cat='batcat --paging=never'
-fi
-
-if command -v fd &>/dev/null; then
-    alias ff='fd --type f'
-    alias fdir='fd --type d'
-elif command -v fdfind &>/dev/null; then
-    alias fd='fdfind'
-    alias ff='fdfind --type f'
-    alias fdir='fdfind --type d'
-fi
+ssh() {
+    if [[ -z "$(command ssh "$@" 'infocmp $TERM 2>/dev/null')" ]]; then
+        TERM=xterm-256color command ssh "$@"
+    else
+        command ssh "$@"
+    fi
+}
 
 #── Functions ────────────────────────────────────────────────
 clip() {
@@ -334,6 +313,81 @@ set_ssh_proxy() {
         return 1
     fi
 
+    # Split user and host
+    local user="${input%@*}"
+    local host="${input#*@}"
+    if [ -z "$user" ] || [ -z "$host" ] || [ "$user" = "$host" ]; then
+        echo "Error: Invalid format. Use user@ip (e.g. root@1.2.3.4)"
+        return 1
+    fi
+
+    sshuttle -r "${user}@${host}" \
+        --dns --auto-hosts \
+        --no-latency-control \
+        --exclude "$host" \
+        --exclude 127.0.0.0/8 \
+        --exclude 10.0.0.0/8 \
+        --exclude 172.16.0.0/12 \
+        --exclude 192.168.0.0/16 \
+        --method=auto \
+        -e 'ssh -o Compression=no -o TCPKeepAlive=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o "IPQoS=lowdelay throughput" -o Ciphers=chacha20-poly1305@openssh.com,aes128-gcm@openssh.com -o KexAlgorithms=curve25519-sha256' \
+        0/0
+}
+
+# ssh -D 1080 -C root@95.182.92.67
+set_ssh_proxy_port() {
+    local port="$1"
+    local input="$2"
+
+    if [ -z "$port" ] || [ -z "$input" ]; then
+        echo "Error: Please provide port and user@ip"
+        echo "Usage: set_ssh_proxy_port <port> <user@ip>"
+        return 1
+    fi
+
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        echo "Error: Invalid port '$port'"
+        return 1
+    fi
+
+    # Split user and host
+    local user="${input%@*}"
+    local host="${input#*@}"
+    if [ -z "$user" ] || [ -z "$host" ] || [ "$user" = "$host" ]; then
+        echo "Error: Invalid format. Use user@ip (e.g. root@1.2.3.4)"
+        return 1
+    fi
+
+    if ! command -v ssh >/dev/null 2>&1; then
+        echo "Error: ssh is not installed"
+        return 1
+    fi
+
+    echo "Starting SOCKS5 proxy on 127.0.0.1:${port} via ${user}@${host} ..."
+
+    ssh -N -T -D "127.0.0.1:${port}" "${user}@${host}" \
+        -o ExitOnForwardFailure=yes \
+        -o Compression=no \
+        -o TCPKeepAlive=yes \
+        -o ServerAliveInterval=15 \
+        -o ServerAliveCountMax=4 \
+        -o IPQoS="lowdelay throughput" \
+        -o Ciphers=chacha20-poly1305@openssh.com,aes128-gcm@openssh.com \
+        -o KexAlgorithms=curve25519-sha256
+}
+set_ssh_proxy() {
+    local input="$1"
+    if [ -z "$input" ]; then
+        echo "Error: Please provide user@ip"
+        echo "Usage: set_ssh_proxy <user@ip>"
+        return 1
+    fi
+
+    if ! command -v sshuttle >/dev/null 2>&1; then
+        echo "Error: sshuttle is not installed"
+        return 1
+    fi
+
     local user host
     read -r user host < <(_parse_userhost "$input") || return 1
 
@@ -351,7 +405,6 @@ set_ssh_proxy() {
         0/0
 }
 
-# ssh -D 1080 -C root@95.182.92.67
 set_ssh_proxy_port() {
     local port="$1"
     local input="$2"
@@ -754,6 +807,54 @@ clean_claude() {
       "$input" > "$output"
 }
 
+#── FZF & Friends ────────────────────────────────────────────────
+
+install_fzf_tools() {
+    echo "=== Installing eza, bat, fd, fzf, ripgrep ==="
+
+    if command -v apt &>/dev/null; then
+        sudo apt update
+        sudo apt install -y eza bat fd-find fzf ripgrep
+
+        # Debian/Ubuntu ship these under different binary names
+        mkdir -p ~/.local/bin
+        [ -x /usr/bin/batcat ] && [ ! -e ~/.local/bin/bat ] && ln -s "$(command -v batcat)" ~/.local/bin/bat
+        [ -x /usr/bin/fdfind ] && [ ! -e ~/.local/bin/fd ] && ln -s "$(command -v fdfind)" ~/.local/bin/fd
+
+    elif command -v dnf &>/dev/null; then
+        sudo dnf install -y eza bat fd-find fzf ripgrep
+
+    elif command -v pacman &>/dev/null; then
+        sudo pacman -Sy --needed eza bat fd fzf ripgrep
+
+    elif command -v apk &>/dev/null; then
+        sudo apk add eza bat fd fzf ripgrep
+
+    elif command -v brew &>/dev/null; then
+        brew install eza bat fd fzf ripgrep
+
+    else
+        echo "✗ No supported package manager found (apt/dnf/pacman/apk/brew)"
+        echo "  Falling back to fzf git install..."
+        git clone --depth 1 https://github.com/junegunn/fzf.git ~/.fzf
+        ~/.fzf/install --all
+        return
+    fi
+
+    echo "✓ Done. Restart your shell or run 'reload'."
+}
+
+fzf-open-widget() {
+    local file
+    file=$(fzf --height 60% --layout=reverse --preview \
+        'command -v bat &>/dev/null && bat --style=numbers --color=always --line-range :200 {} || cat {}' < /dev/tty)
+    if [[ -n "$file" ]]; then
+        READLINE_LINE="${EDITOR:-nvim} \"$file\""
+        READLINE_POINT=${#READLINE_LINE}
+    fi
+}
+bind -x '"\C-f": fzf-open-widget'
+
 #── APPS ────────────────────────────────────────────────
 
 # go
@@ -790,28 +891,3 @@ npm_no_cahe() {
 # snap
 export PATH="$PATH:/var/lib/snapd/snap/bin"
 
-#── FZF Keybindings (bash) ────────────────────────────────────────────────
-# Must come after any other bind/completion setup so nothing else overrides ^F.
-
-# Load fzf's own key-bindings/completion if the package shipped bash versions
-[ -f /usr/share/doc/fzf/examples/key-bindings.bash ] && source /usr/share/doc/fzf/examples/key-bindings.bash
-[ -f /usr/share/fzf/key-bindings.bash ] && source /usr/share/fzf/key-bindings.bash
-[ -f /usr/share/doc/fzf/examples/completion.bash ] && source /usr/share/doc/fzf/examples/completion.bash
-[ -f /usr/share/fzf/completion.bash ] && source /usr/share/fzf/completion.bash
-[ -f ~/.fzf.bash ] && source ~/.fzf.bash
-
-# Ctrl+F: fuzzy-find a file and open it in $EDITOR (with bat preview if available)
-fzf-open-widget() {
-    local file
-    file=$(fzf --height 60% --layout=reverse --preview \
-        'command -v bat &>/dev/null && bat --style=numbers --color=always --line-range :200 {} || cat {}' < /dev/tty)
-    if [[ -n "$file" ]]; then
-        READLINE_LINE="${EDITOR:-nvim} \"$file\""
-        READLINE_POINT=${#READLINE_LINE}
-    fi
-}
-# bind -x runs the function on Ctrl+F and gives it access to READLINE_LINE/READLINE_POINT
-bind -x '"\C-f": fzf-open-widget'
-
-#── ble.sh attach (must be the very last line) ──────────
-[[ ${BLE_VERSION-} ]] && ble-attach
