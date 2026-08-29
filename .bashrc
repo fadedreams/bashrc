@@ -85,8 +85,8 @@ git_test() {
 
 alias tree="command tree -I 'node_modules|dist|.git|.next|.gitignore|.DS_Store|.env|.env.local|.cache|.vscode|.idea|coverage|build|out|tmp|.turbo|.eslintcache'"
 
-function ssh() {
-    if [[ -z "$(command ssh "$@" 'infocmp $TERM 2>/dev/null')" ]]; then
+ssh() {
+    if [[ "$TERM" == "xterm-ghostty" ]]; then
         TERM=xterm-256color command ssh "$@"
     else
         command ssh "$@"
