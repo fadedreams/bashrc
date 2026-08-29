@@ -177,27 +177,27 @@ clip() {
 
 kill_port() {
     if [ -z "$1" ]; then
-        echo "Usage: kill_port <port_number>"
+        echo "Usage: kill_port <port_number> [port_number2 ...]"
         return 1
     fi
-    local port=$1
-    local info
-    info=$(sudo ss -lptn "sport = :$port" 2>/dev/null)
 
-    if [ -z "$(echo "$info" | tail -n +2)" ]; then
-        echo "No process found listening on port $port"
-        return 0
-    fi
-
-    echo "$info"
-    sudo fuser -k "$port"/tcp 2>/dev/null
-    sleep 0.5
-
-    if sudo ss -lptn "sport = :$port" 2>/dev/null | grep -q LISTEN; then
-        echo "⚠ Port $port may still be in use"
-    else
-        echo "✓ Port $port is now free"
-    fi
+    local port
+    for port in "$@"; do
+        local info
+        info=$(sudo ss -lptn "sport = :$port" 2>/dev/null)
+        if [ -z "$(echo "$info" | tail -n +2)" ]; then
+            echo "No process found listening on port $port"
+            continue
+        fi
+        echo "$info"
+        sudo fuser -k "$port"/tcp 2>/dev/null
+        sleep 0.5
+        if sudo ss -lptn "sport = :$port" 2>/dev/null | grep -q LISTEN; then
+            echo "⚠ Port $port may still be in use"
+        else
+            echo "✓ Port $port is now free"
+        fi
+    done
 }
 
 kill9() {
@@ -206,18 +206,28 @@ kill9() {
 
 check_port() {
     if [[ -z "$1" ]]; then
-        echo "Usage: lp <port>"
+        echo "Usage: check_port <port> [port2] [port3] ..."
         return 1
     fi
-    local port="$1"
-    if sudo ss -tuln | grep -q ":${port}[[:space:]]"; then
-        echo "Port $port is OPEN"
-        sudo ss -ltunp "( sport = :$port )"
-        return 0
-    else
-        echo "Port $port is CLOSED"
-        return 1
-    fi
+
+    local ss_output
+    ss_output=$(sudo ss -tuln)
+
+    local port
+    local any_closed=0
+
+    for port in "$@"; do
+        if echo "$ss_output" | grep -q ":${port}[[:space:]]"; then
+            echo "Port $port is OPEN"
+            sudo ss -ltunp "( sport = :$port )"
+        else
+            echo "Port $port is CLOSED"
+            any_closed=1
+        fi
+        echo "---"
+    done
+
+    return $any_closed
 }
 
 # ssh_port_forward local_port:remote_port m@5.161.157.120
