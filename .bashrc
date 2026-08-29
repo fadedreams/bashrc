@@ -85,7 +85,7 @@ git_test() {
 
 alias tree="command tree -I 'node_modules|dist|.git|.next|.gitignore|.DS_Store|.env|.env.local|.cache|.vscode|.idea|coverage|build|out|tmp|.turbo|.eslintcache'"
 
-ssh() {
+function ssh() {
     if [[ "$TERM" == "xterm-ghostty" ]]; then
         TERM=xterm-256color command ssh "$@"
     else
