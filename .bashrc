@@ -534,6 +534,13 @@ set_terminal_proxy_mhm() {
     export all_proxy="socks5://127.0.0.1:8085"
 }
 
+set_terminal_proxy_hiddify() {
+    export http_proxy="socks5://127.0.0.1:12334"
+    export https_proxy="socks5://127.0.0.1:12334"
+    export all_proxy="socks5://127.0.0.1:12334"
+}
+
+
 function ssh_proxy_v2rayn() {
     /usr/bin/ssh -o "ProxyCommand=nc -X 5 -x 127.0.0.1:10808 %h %p" "$1"
 }
