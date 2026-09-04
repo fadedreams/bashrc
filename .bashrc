@@ -46,7 +46,7 @@ alias top10='ps aux --sort=-%mem | head -11'
 alias ramcheck='watch -n 2 "free -h && echo && zramctl && echo && swapon --show"'
 
 # Network
-alias myip='curl -s ifconfig.me'
+alias myip='curl -s icanhazip.com'
 alias localip='ip -4 addr show | grep -oP "(?<=inet\s)\d+(\.\d+){3}" | grep -v 127.0.0.1'
 alias ports='ss -tulanp'
 alias lsof-port='lsof -i'
