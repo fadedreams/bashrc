@@ -1,5 +1,5 @@
 #── Aliases ────────────────────────────────────────────────
-
+alias vi=vim
 alias py="python3"
 alias docker-compose="docker compose"
 alias reload='source ~/.zshrc'
