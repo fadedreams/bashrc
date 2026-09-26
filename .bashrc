@@ -676,8 +676,6 @@ bat_info() {
     cat /sys/class/power_supply/BAT*/{status,capacity}
 }
 
-dig() { command dig +short @1.1.1.1 "$@"; }
-
 #── flush ────────────────────────────────────────────────
 #flush save
 #flush restore
