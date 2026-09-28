@@ -468,6 +468,7 @@ set_ssh_proxy_port() {
         return 1
     fi
 }
+
 # jump
 set_ssh_proxy_jump() {
     local vps1="$1"
@@ -497,23 +498,51 @@ set_ssh_proxy_jump() {
         0/0
 }
 
-# ssh -D 1080 -C root@95.182.81.164
-# ssh jump
-# ssh -D 1080 -C -o ProxyCommand="ssh -W %h:%p root@95.38.233.143" root@95.182.81.164
-set_terminal_socks_port() {
-    if [ -z "$1" ]; then
-        echo "Usage: set_terminal_proxy_port <port>"
-        echo "Example: set_terminal_proxy_port 1080"
+set_terminal_proxy_socks() {
+    local default_host="127.0.0.1"
+    local host="$default_host"
+    local port
+
+    case "$#" in
+        1)
+            if [[ "$1" == *:* ]]; then
+                host="${1%:*}"
+                port="${1##*:}"
+            else
+                port="$1"
+            fi
+            ;;
+        2)
+            host="$1"
+            port="$2"
+            ;;
+        *)
+            echo "Usage: set_terminal_socks_port [host] <port>"
+            echo "   or: set_terminal_socks_port <host:port>"
+            echo "Default host: $default_host"
+            echo "Examples:"
+            echo "  set_terminal_socks_port 1080"
+            echo "  set_terminal_socks_port 192.168.1.10 1080"
+            echo "  set_terminal_socks_port 127.0.0.1:1080"
+            return 1
+            ;;
+    esac
+
+    # Fall back to the default if host was left empty (e.g. ":1080")
+    host="${host:-$default_host}"
+
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+        echo "Error: invalid port '$port'"
         return 1
     fi
 
-    local port=$1
-    export http_proxy="socks5h://127.0.0.1:$port"
-    export https_proxy="socks5h://127.0.0.1:$port"
-    export ALL_PROXY="socks5h://127.0.0.1:$port"
+    export http_proxy="socks5h://$host:$port"
+    export https_proxy="socks5h://$host:$port"
+    export ALL_PROXY="socks5h://$host:$port"
 
-    echo "✓ Terminal proxy set to socks5h://127.0.0.1:$port"
+    echo "✓ Terminal proxy set to socks5h://$host:$port"
 }
+
 
 
 set_terminal_proxy_v2raya() {
