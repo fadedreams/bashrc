@@ -565,6 +565,12 @@ function unset_terminal_proxy() {
     unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy NO_PROXY no_proxy
 }
 
+# check_share_proxy 192.168.1.5 8080  #for check_share_proxy
+check_share_proxy() {
+  local host="${1:-192.168.1.2}"
+  local port="${2:-10808}"
+  nc -zv -w 5 "$host" "$port"
+}
 
 brave_proxy() {
     brave --proxy-server="socks5://127.0.0.1:10808" "$@" &
