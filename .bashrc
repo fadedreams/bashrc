@@ -294,179 +294,155 @@ find_process() {
 
 
 #── PROXY ────────────────────────────────────────────────
-
-# Shared helper: parses "user@host" into two space-separated values on stdout.
-# Usage: read -r user host < <(_parse_userhost "$input") || return 1
-_parse_userhost() {
-    local input="$1"
-    local user="${input%@*}"
-    local host="${input#*@}"
-    if [ -z "$user" ] || [ -z "$host" ] || [ "$user" = "$host" ]; then
-        echo "Error: Invalid format. Use user@ip (e.g. root@1.2.3.4)" >&2
-        return 1
-    fi
-    echo "$user" "$host"
-}
-
-# sudo pacman -S sshuttle
-set_ssh_proxy() {
-    local input="$1"
-    if [ -z "$input" ]; then
-        echo "Error: Please provide user@ip"
-        echo "Usage: set_ssh_proxy <user@ip>"
-        return 1
-    fi
-
-    if ! command -v sshuttle >/dev/null 2>&1; then
-        echo "Error: sshuttle is not installed"
-        return 1
-    fi
-
-    # Split user and host
-    local user="${input%@*}"
-    local host="${input#*@}"
-    if [ -z "$user" ] || [ -z "$host" ] || [ "$user" = "$host" ]; then
-        echo "Error: Invalid format. Use user@ip (e.g. root@1.2.3.4)"
-        return 1
-    fi
-
-    sshuttle -r "${user}@${host}" \
-        --dns --auto-hosts \
-        --no-latency-control \
-        --exclude "$host" \
-        --exclude 127.0.0.0/8 \
-        --exclude 10.0.0.0/8 \
-        --exclude 172.16.0.0/12 \
-        --exclude 192.168.0.0/16 \
-        --method=auto \
-        -e 'ssh -o Compression=no -o TCPKeepAlive=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o "IPQoS=lowdelay throughput" -o Ciphers=chacha20-poly1305@openssh.com,aes128-gcm@openssh.com -o KexAlgorithms=curve25519-sha256' \
-        0/0
-}
-
-# ssh -D 1080 -C root@95.182.92.67
-set_ssh_proxy_port() {
-    local port="$1"
-    local input="$2"
-
-    if [ -z "$port" ] || [ -z "$input" ]; then
-        echo "Error: Please provide port and user@ip"
-        echo "Usage: set_ssh_proxy_port <port> <user@ip>"
-        return 1
-    fi
-
-    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-        echo "Error: Invalid port '$port'"
-        return 1
-    fi
-
-    # Split user and host
-    local user="${input%@*}"
-    local host="${input#*@}"
-    if [ -z "$user" ] || [ -z "$host" ] || [ "$user" = "$host" ]; then
-        echo "Error: Invalid format. Use user@ip (e.g. root@1.2.3.4)"
-        return 1
-    fi
-
-    if ! command -v ssh >/dev/null 2>&1; then
-        echo "Error: ssh is not installed"
-        return 1
-    fi
-
-    echo "Starting SOCKS5 proxy on 127.0.0.1:${port} via ${user}@${host} ..."
-
-    ssh -N -T -D "127.0.0.1:${port}" "${user}@${host}" \
-        -o ExitOnForwardFailure=yes \
-        -o Compression=no \
-        -o TCPKeepAlive=yes \
-        -o ServerAliveInterval=15 \
-        -o ServerAliveCountMax=4 \
-        -o IPQoS="lowdelay throughput" \
-        -o Ciphers=chacha20-poly1305@openssh.com,aes128-gcm@openssh.com \
-        -o KexAlgorithms=curve25519-sha256
-}
-set_ssh_proxy() {
-    local input="$1"
-    if [ -z "$input" ]; then
-        echo "Error: Please provide user@ip"
-        echo "Usage: set_ssh_proxy <user@ip>"
-        return 1
-    fi
-
-    if ! command -v sshuttle >/dev/null 2>&1; then
-        echo "Error: sshuttle is not installed"
-        return 1
-    fi
-
-    local user host
-    read -r user host < <(_parse_userhost "$input") || return 1
-
-    echo "Starting sshuttle full-tunnel via ${user}@${host} (may prompt for sudo) ..."
-    sshuttle -r "${user}@${host}" \
-        --dns --auto-hosts \
-        --no-latency-control \
-        --exclude "$host" \
-        --exclude 127.0.0.0/8 \
-        --exclude 10.0.0.0/8 \
-        --exclude 172.16.0.0/12 \
-        --exclude 192.168.0.0/16 \
-        --method=auto \
-        -e 'ssh -o Compression=no -o TCPKeepAlive=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o "IPQoS=lowdelay throughput" -o Ciphers=chacha20-poly1305@openssh.com,aes128-gcm@openssh.com -o KexAlgorithms=curve25519-sha256' \
-        0/0
-}
-
-set_ssh_proxy_port() {
-    local port="$1"
-    local input="$2"
-    if [ -z "$port" ] || [ -z "$input" ]; then
-        echo "Error: Please provide port and user@ip"
-        echo "Usage: set_ssh_proxy_port <port> <user@ip>"
-        return 1
-    fi
-
-    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-        echo "Error: Invalid port '$port'"
-        return 1
-    fi
-
-    if ! command -v ssh >/dev/null 2>&1; then
-        echo "Error: ssh is not installed"
-        return 1
-    fi
-
-    local user host
-    read -r user host < <(_parse_userhost "$input") || return 1
-
-    # Check the local port isn't already bound
-    if command -v lsof >/dev/null 2>&1; then
-        if lsof -i ":${port}" >/dev/null 2>&1; then
-            echo "Error: Port ${port} is already in use"
-            return 1
-        fi
-    elif command -v ss >/dev/null 2>&1; then
-        if ss -ltn "( sport = :${port} )" 2>/dev/null | grep -q ":${port}"; then
-            echo "Error: Port ${port} is already in use"
-            return 1
-        fi
-    fi
-
-    echo "Starting SOCKS5 proxy on 127.0.0.1:${port} via ${user}@${host} ..."
-    ssh -f -N -T -D "127.0.0.1:${port}" "${user}@${host}" \
-        -o ExitOnForwardFailure=yes \
-        -o Compression=no \
-        -o TCPKeepAlive=yes \
-        -o ServerAliveInterval=15 \
-        -o ServerAliveCountMax=4 \
-        -o IPQoS="lowdelay throughput" \
-        -o Ciphers=chacha20-poly1305@openssh.com,aes128-gcm@openssh.com \
-        -o KexAlgorithms=curve25519-sha256
-
-    if [ $? -eq 0 ]; then
-        echo "Proxy running in background on 127.0.0.1:${port}"
-        echo "Stop it with: pkill -f 'ssh.*-D 127.0.0.1:${port}'"
+function ssh() {
+    if [[ "$TERM" == "xterm-ghostty" ]]; then
+        TERM=xterm-256color command ssh "$@"
     else
-        echo "Error: Failed to start proxy"
-        return 1
+        command ssh "$@"
     fi
+}
+
+
+# Route the current terminal through an SSH SOCKS tunnel: set_ssh_terminal user@host [port]
+set_ssh_terminal() {
+  local target="$1"
+  local port="${2:-10810}"
+  local url="socks5h://127.0.0.1:$port"
+  local sock="$HOME/.ssh/proxy-${target//[^a-zA-Z0-9]/_}.sock"
+
+  if [[ "$target" != *@* ]]; then
+    echo "Usage: proxy user@host [port]"
+    return 1
+  fi
+
+  if ! ssh -S "$sock" -O check "$target" 2>/dev/null; then
+    ssh -fN -D "127.0.0.1:$port" \
+      -M -S "$sock" \
+      -o ServerAliveInterval=30 \
+      -o ServerAliveCountMax=3 \
+      -o ExitOnForwardFailure=yes \
+      "$target" || { echo "Failed to start tunnel"; return 1; }
+  fi
+
+  export ALL_PROXY="$url" all_proxy="$url" \
+         HTTP_PROXY="$url" http_proxy="$url" \
+         HTTPS_PROXY="$url" https_proxy="$url" \
+         NO_PROXY="localhost,127.0.0.1,::1" no_proxy="localhost,127.0.0.1,::1"
+
+  echo "This terminal now goes through $target (socks5h://127.0.0.1:$port)"
+}
+
+# Route the ENTIRE system through an SSH server: set_ssh_all user@host
+# set_ssh_all off
+set_ssh_all() {
+  local target="$1"
+  local pidfile="/tmp/set_ssh_all.pid"
+
+  if [[ "$target" == "off" || "$target" == "stop" ]]; then
+    if sudo test -f "$pidfile"; then
+      sudo kill "$(sudo cat "$pidfile")" 2>/dev/null
+      sudo rm -f "$pidfile"
+      echo "System-wide tunnel stopped"
+    else
+      echo "System-wide tunnel not running"
+    fi
+    return
+  fi
+
+  if [[ "$target" != *@* ]]; then
+    echo "Usage: set_ssh_all user@host   |   set_ssh_all off"
+    return 1
+  fi
+
+  if ! command -v sshuttle >/dev/null; then
+    echo "sshuttle not installed. Install it with:"
+    echo "  macOS:  brew install sshuttle"
+    echo "  Debian/Ubuntu:  sudo apt install sshuttle"
+    echo "  other:  pip install sshuttle"
+    return 1
+  fi
+
+  if sudo test -f "$pidfile" && sudo kill -0 "$(sudo cat "$pidfile")" 2>/dev/null; then
+    echo "Already running. Use: set_ssh_all off"
+    return 1
+  fi
+
+  local host="${target#*@}"
+
+  sudo sshuttle -D --pidfile="$pidfile" \
+    -r "$target" 0.0.0.0/0 \
+    --dns \
+    -x "$host" \
+    && echo "Entire system now routed through $target (stop with: set_ssh_all off)"
+}
+
+# SSH SOCKS tunnel on a chosen local port: set_ssh_port port user@host
+# set_ssh_port off 10808
+set_ssh_port() {
+  local port="$1"
+  local target="$2"
+  local sock="$HOME/.ssh/sshport-${port}.sock"
+  local url="socks5h://127.0.0.1:$port"
+
+  if [[ "$port" == "off" || "$port" == "stop" ]]; then
+    local p="$2"
+    sock="$HOME/.ssh/sshport-${p}.sock"
+    unset ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy NO_PROXY no_proxy
+    ssh -S "$sock" -O exit dummy 2>/dev/null \
+      && echo "Tunnel on port $p stopped, env vars cleared" \
+      || echo "No tunnel on port $p, env vars cleared"
+    return
+  fi
+
+  if [[ ! "$port" =~ ^[0-9]+$ || "$target" != *@* ]]; then
+    echo "Usage: set_ssh_port port user@host   |   set_ssh_port off port"
+    return 1
+  fi
+
+  if ssh -S "$sock" -O check dummy 2>/dev/null; then
+    echo "Tunnel already running on port $port"
+  else
+    ssh -fN -D "127.0.0.1:$port" \
+      -M -S "$sock" \
+      -o ServerAliveInterval=30 \
+      -o ServerAliveCountMax=3 \
+      -o ExitOnForwardFailure=yes \
+      "$target" || { echo "Failed to start tunnel (is port $port in use?)"; return 1; }
+  fi
+
+  export ALL_PROXY="$url" all_proxy="$url" \
+         HTTP_PROXY="$url" http_proxy="$url" \
+         HTTPS_PROXY="$url" https_proxy="$url" \
+         NO_PROXY="localhost,127.0.0.1,::1" no_proxy="localhost,127.0.0.1,::1"
+
+  echo "SOCKS5 on 127.0.0.1:$port via $target (this terminal is using it)"
+}
+
+# Undo everything from proxy, set_ssh_port and set_ssh_all: unset_ssh
+unset_ssh() {
+  local pidfile="/tmp/set_ssh_all.pid"
+  local sock count=0
+
+  # 1) Stop the system-wide sshuttle tunnel (set_ssh_all)
+  if sudo test -f "$pidfile"; then
+    sudo kill "$(sudo cat "$pidfile")" 2>/dev/null
+    sudo rm -f "$pidfile"
+    echo "Stopped system-wide tunnel (set_ssh_all)"
+  fi
+
+  # 2) Close every SOCKS tunnel (set_ssh_port and proxy)
+  while IFS= read -r sock; do
+    [[ -n "$sock" ]] || continue
+    if ssh -S "$sock" -O exit dummy 2>/dev/null; then
+      echo "Closed tunnel: $(basename "$sock")"
+      count=$((count + 1))
+    fi
+    rm -f "$sock"   # remove stale sockets too
+  done < <(find "$HOME/.ssh" -maxdepth 1 \( -name 'sshport-*.sock' -o -name 'proxy-*.sock' \) 2>/dev/null)
+
+  # 3) Clear proxy variables in this terminal
+  unset ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy NO_PROXY no_proxy
+  echo "Proxy env vars cleared in this terminal ($count SOCKS tunnel(s) closed)"
 }
 
 # jump
@@ -497,6 +473,7 @@ set_ssh_proxy_jump() {
         -e "ssh -o Compression=no -o TCPKeepAlive=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o 'IPQoS=lowdelay throughput' -o Ciphers=chacha20-poly1305@openssh.com,aes128-gcm@openssh.com -o KexAlgorithms=curve25519-sha256 -o ProxyCommand='ssh -W %h:%p $vps1'" \
         0/0
 }
+
 
 set_terminal_proxy_socks() {
     local default_host="127.0.0.1"
@@ -575,6 +552,20 @@ function ssh_proxy_v2rayn() {
 
 function ssh_proxy_v2raya() {
     /usr/bin/ssh -o "ProxyCommand=nc -X 5 -x 127.0.0.1:20170 %h %p" "$1"
+}
+
+# Clear proxy variables set by the v2rayA / v2rayN / Hiddify functions (and any others)
+unset_terminal_proxy() {
+  unset http_proxy https_proxy all_proxy ftp_proxy no_proxy \
+        HTTP_PROXY HTTPS_PROXY ALL_PROXY FTP_PROXY NO_PROXY
+  echo "Terminal proxy variables cleared"
+}
+
+# Clear everything: SSH tunnels, sshuttle, and all proxy variables
+unset_proxy() {
+  unset_ssh
+  unset_terminal_proxy
+  echo "Everything cleared: SSH tunnels, system-wide tunnel, and terminal proxy variables"
 }
 
 function vnc-tunnel() {
