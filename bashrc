@@ -89,15 +89,17 @@ git_test() {
 alias tree="command tree -I 'node_modules|dist|.git|.next|.gitignore|.DS_Store|.env|.env.local|.cache|.vscode|.idea|coverage|build|out|tmp|.turbo|.eslintcache'"
 
 #── Functions ────────────────────────────────────────────────
-# ── clip ─────────────────────────────────────────────────
+# ── clip / clip_show (works in zsh and bash) ─────────────
 
-# zsh only: rewrite a trailing "| clip" into "|& clip" so stderr is piped too.
-# In bash, type "|& clip" yourself if you want stderr.
+# zsh only: rewrite a trailing "| clip" or "| clip_show" into "|& ..." so
+# stderr is piped too. In bash, type "|& clip" yourself (needs bash 4+),
+# or use "2>&1 | clip".
 if [ -n "$ZSH_VERSION" ]; then
     _clip_accept_line() {
-        local suffix='| clip'
-        if [[ $BUFFER == *"$suffix" ]]; then
-            BUFFER="${BUFFER%"$suffix"}|& clip"
+        if [[ $BUFFER == *"| clip" ]]; then
+            BUFFER="${BUFFER%"| clip"}|& clip"
+        elif [[ $BUFFER == *"| clip_show" ]]; then
+            BUFFER="${BUFFER%"| clip_show"}|& clip_show"
         fi
         zle .accept-line
     }
@@ -119,7 +121,7 @@ _clip_bar() {
     [ -t 2 ] || return 0
     local cur=$1 total=$2 width=30 pct filled i bar=""
     [ "$total" -gt 0 ] || total=1
-    [ "$cur" -gt "$total" ] && cur=$total
+    if [ "$cur" -gt "$total" ]; then cur=$total; fi
     pct=$(( cur * 100 / total ))
     filled=$(( pct * width / 100 ))
     for (( i = 0; i < width; i++ )); do
@@ -142,8 +144,8 @@ _clip_stream() {
         off=$(( off + chunk ))
         i=$(( i + 1 ))
         cur=$off
-        [ "$cur" -gt "$total" ] && cur=$total
-        [ -z "$q" ] && _clip_bar "$cur" "$total"
+        if [ "$cur" -gt "$total" ]; then cur=$total; fi
+        if [ -z "$q" ]; then _clip_bar "$cur" "$total"; fi
     done
 }
 
@@ -151,21 +153,20 @@ _clip_stream() {
 # With "quiet" it draws nothing (used for periodic refreshes while streaming).
 # Usage: _clip_send_file <file> [quiet]
 _clip_send_file() {
-    local f=$1 q=$2 total rc
+    local f=$1 q=$2 total rc=0 b64="" chunk=65535 off=0 i=0 cur
     total=$(wc -c <"$f" | tr -d ' ')
 
     if [[ "$OSTYPE" == "darwin"* ]]; then
         _clip_stream "$f" "$total" "$q" | pbcopy; rc=$?
     elif [ -n "$SSH_CONNECTION" ] || [ -n "$SSH_CLIENT" ] || [ -n "$SSH_TTY" ]; then
         # OSC 52: encode in chunks (multiple of 3 bytes so base64 joins cleanly)
-        local b64="" chunk=65535 off=0 i=0 cur
         while [ "$off" -lt "$total" ]; do
             b64+=$(dd if="$f" bs=$chunk skip=$i count=1 2>/dev/null | base64 | tr -d '\n')
             off=$(( off + chunk ))
             i=$(( i + 1 ))
             cur=$off
-            [ "$cur" -gt "$total" ] && cur=$total
-            [ -z "$q" ] && _clip_bar "$cur" "$total"
+            if [ "$cur" -gt "$total" ]; then cur=$total; fi
+            if [ -z "$q" ]; then _clip_bar "$cur" "$total"; fi
         done
         if [ -n "$TMUX" ]; then
             printf '\033Ptmux;\033\033]52;c;%s\a\033\\' "$b64" > /dev/tty
@@ -180,24 +181,27 @@ _clip_send_file() {
     elif command -v wl-copy &> /dev/null; then
         _clip_stream "$f" "$total" "$q" | wl-copy; rc=$?
     else
-        [ -z "$q" ] && _clip_progress_clear
+        if [ -z "$q" ]; then _clip_progress_clear; fi
         echo "Error: No clipboard utility found" >&2
         return 1
     fi
 
-    [ -z "$q" ] && _clip_progress_clear
+    if [ -z "$q" ]; then _clip_progress_clear; fi
     return $rc
 }
 
+# ── clip: copies silently with progress (nothing printed to the terminal) ──
 # Usage: clip <file> | clip <command> [args...] | <cmd> | clip
 clip() {
+    local tmp line n=0 interrupted=0 last=$SECONDS rc=0 size pid i=0
+    local is_file=0 had_monitor=0
+
     # ── Piped input (streaming-friendly) ──
     if [ $# -eq 0 ]; then
         if [ -t 0 ]; then
             echo "Usage: clip <file> | clip <command> [args...] | <cmd> | clip"
             return 1
         fi
-        local tmp line n=0 interrupted=0 last=$SECONDS rc size
         tmp=$(mktemp) || return 1
         exec 3>>"$tmp"
         trap 'interrupted=1' INT
@@ -236,7 +240,6 @@ clip() {
     fi
 
     # ── Decide: file or command ──
-    local is_file=0
     if [ $# -eq 1 ] && [ -f "$1" ] && [ -r "$1" ]; then
         is_file=1
     elif [ $# -gt 1 ] && [ -e "$1" ]; then
@@ -248,7 +251,7 @@ clip() {
     # ── File mode ──
     if [ "$is_file" -eq 1 ]; then
         _clip_send_file "$1"
-        local rc=$?
+        rc=$?
         if [ "$rc" -ne 0 ]; then
             echo "Error: Failed to copy '$1'" >&2
             return 1
@@ -258,9 +261,14 @@ clip() {
     fi
 
     # ── Command mode (streaming-friendly) ──
-    [ -n "$ZSH_VERSION" ] && setopt local_options no_monitor no_notify
-    local tmp pid rc i=0 interrupted=0 last=$SECONDS
     tmp=$(mktemp) || return 1
+
+    # Silence background-job messages ([1] 1234 / Done) in each shell
+    if [ -n "$ZSH_VERSION" ]; then
+        setopt local_options no_monitor no_notify
+    else
+        case $- in *m*) had_monitor=1; set +m ;; esac
+    fi
 
     trap 'interrupted=1' INT
     { "$@" >"$tmp" 2>&1 & } 2>/dev/null
@@ -284,6 +292,7 @@ clip() {
     wait "$pid" 2>/dev/null
     rc=$?
     trap - INT
+    if [ "$had_monitor" -eq 1 ]; then set -m; fi
     _clip_progress_clear
 
     if [ "$interrupted" -eq 1 ]; then
@@ -307,6 +316,77 @@ clip() {
         echo "✓ Copied output of '$*' to clipboard"
     fi
     return $rc
+}
+
+# ── clip_show: like clip, but also prints the content to the terminal ──
+# Usage: clip_show <file> | clip_show <command> [args...] | <cmd> | clip_show
+clip_show() {
+    local tmp line n=0 interrupted=0 last=$SECONDS rc=0 size rcf
+
+    # ── Piped input: print each line live, copy as it arrives ──
+    if [ $# -eq 0 ]; then
+        if [ -t 0 ]; then
+            echo "Usage: clip_show <file> | clip_show <command> [args...] | <cmd> | clip_show"
+            return 1
+        fi
+        tmp=$(mktemp) || return 1
+        exec 3>>"$tmp"
+        trap 'interrupted=1' INT
+
+        while [ "$interrupted" -eq 0 ] && { IFS= read -r line || [ -n "$line" ]; }; do
+            printf '%s\n' "$line"          # show in terminal
+            printf '%s\n' "$line" >&3      # save for clipboard
+            n=$((n + 1))
+            # Refresh the clipboard every ~2s so partial results are never lost
+            if [ $((SECONDS - last)) -ge 2 ]; then
+                _clip_send_file "$tmp" quiet
+                last=$SECONDS
+            fi
+        done
+
+        trap - INT
+        exec 3>&-
+
+        _clip_send_file "$tmp" quiet
+        rc=$?
+        size=$(wc -c <"$tmp" | tr -d ' ')
+        rm -f "$tmp"
+        if [ "$rc" -ne 0 ]; then
+            echo "Error: Failed to copy piped input" >&2
+        elif [ "$interrupted" -eq 1 ]; then
+            echo "✓ Interrupted. Copied $n lines so far ($(( size / 1024 )) KB)" >&2
+            return 130
+        else
+            echo "✓ Copied piped input to clipboard ($n lines, $(( size / 1024 )) KB)" >&2
+        fi
+        return $rc
+    fi
+
+    # ── File mode: show the file, then copy it ──
+    if [ $# -eq 1 ] && [ -f "$1" ] && [ -r "$1" ]; then
+        cat "$1"
+        if ! _clip_send_file "$1" quiet; then
+            echo "Error: Failed to copy '$1'" >&2
+            return 1
+        fi
+        echo "✓ Copied contents of '$1' to clipboard" >&2
+        return 0
+    elif [ $# -gt 1 ] && [ -e "$1" ]; then
+        echo "Error: '$1' exists as a file, but you passed extra arguments ($*)." >&2
+        echo "If the filename has spaces, quote it: clip_show \"$*\"" >&2
+        return 1
+    fi
+
+    # ── Command mode: run it, show output live, copy as it arrives ──
+    rcf=$(mktemp) || return 1
+    { "$@" 2>&1; echo $? >"$rcf"; } | clip_show
+    rc=$(cat "$rcf" 2>/dev/null)
+    rm -f "$rcf"
+    if [ -z "$rc" ]; then rc=130; fi
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 130 ]; then
+        echo "⚠ Command exited with status $rc (output was still copied)" >&2
+    fi
+    return "$rc"
 }
 
 #── PORT ────────────────────────────────────────────────
