@@ -104,49 +104,138 @@ if [ -n "$ZSH_VERSION" ]; then
     zle -N accept-line _clip_accept_line
 fi
 
-_clip_copy() {
-    local content="$1"
+# ── progress helpers (all draw on stderr, only when it's a terminal) ──
+
+# Spinner line. Usage: _clip_spinner <index> <label>
+_clip_spinner() {
+    [ -t 2 ] || return 0
+    local frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    local i=$(( $1 % 10 ))
+    printf '\r\033[K%s %s' "${frames:$i:1}" "$2" >&2
+}
+
+# Progress bar. Usage: _clip_bar <bytes-done> <bytes-total>
+_clip_bar() {
+    [ -t 2 ] || return 0
+    local cur=$1 total=$2 width=30 pct filled i bar=""
+    [ "$total" -gt 0 ] || total=1
+    [ "$cur" -gt "$total" ] && cur=$total
+    pct=$(( cur * 100 / total ))
+    filled=$(( pct * width / 100 ))
+    for (( i = 0; i < width; i++ )); do
+        if [ "$i" -lt "$filled" ]; then bar+="█"; else bar+="░"; fi
+    done
+    printf '\r\033[K[%s] %3d%%  %d/%d KB' "$bar" "$pct" $(( cur / 1024 )) $(( total / 1024 )) >&2
+}
+
+_clip_progress_clear() {
+    [ -t 2 ] || return 0
+    printf '\r\033[K' >&2
+}
+
+# Stream a file to stdout in chunks, drawing the bar unless quiet.
+# Usage: _clip_stream <file> <total-bytes> [quiet]
+_clip_stream() {
+    local f=$1 total=$2 q=$3 chunk=65535 off=0 i=0 cur
+    while [ "$off" -lt "$total" ]; do
+        dd if="$f" bs=$chunk skip=$i count=1 2>/dev/null
+        off=$(( off + chunk ))
+        i=$(( i + 1 ))
+        cur=$off
+        [ "$cur" -gt "$total" ] && cur=$total
+        [ -z "$q" ] && _clip_bar "$cur" "$total"
+    done
+}
+
+# Copy a file's exact bytes to the clipboard.
+# With "quiet" it draws nothing (used for periodic refreshes while streaming).
+# Usage: _clip_send_file <file> [quiet]
+_clip_send_file() {
+    local f=$1 q=$2 total rc
+    total=$(wc -c <"$f" | tr -d ' ')
+
     if [[ "$OSTYPE" == "darwin"* ]]; then
-        printf '%s' "$content" | pbcopy
+        _clip_stream "$f" "$total" "$q" | pbcopy; rc=$?
     elif [ -n "$SSH_CONNECTION" ] || [ -n "$SSH_CLIENT" ] || [ -n "$SSH_TTY" ]; then
-        local b64
-        b64=$(printf '%s' "$content" | base64 | tr -d '\n')
+        # OSC 52: encode in chunks (multiple of 3 bytes so base64 joins cleanly)
+        local b64="" chunk=65535 off=0 i=0 cur
+        while [ "$off" -lt "$total" ]; do
+            b64+=$(dd if="$f" bs=$chunk skip=$i count=1 2>/dev/null | base64 | tr -d '\n')
+            off=$(( off + chunk ))
+            i=$(( i + 1 ))
+            cur=$off
+            [ "$cur" -gt "$total" ] && cur=$total
+            [ -z "$q" ] && _clip_bar "$cur" "$total"
+        done
         if [ -n "$TMUX" ]; then
             printf '\033Ptmux;\033\033]52;c;%s\a\033\\' "$b64" > /dev/tty
         else
             printf '\033]52;c;%s\a' "$b64" > /dev/tty
         fi
+        rc=0
     elif command -v xclip &> /dev/null; then
-        printf '%s' "$content" | xclip -selection clipboard
+        _clip_stream "$f" "$total" "$q" | xclip -selection clipboard; rc=$?
     elif command -v xsel &> /dev/null; then
-        printf '%s' "$content" | xsel --clipboard --input
+        _clip_stream "$f" "$total" "$q" | xsel --clipboard --input; rc=$?
     elif command -v wl-copy &> /dev/null; then
-        printf '%s' "$content" | wl-copy
+        _clip_stream "$f" "$total" "$q" | wl-copy; rc=$?
     else
+        [ -z "$q" ] && _clip_progress_clear
         echo "Error: No clipboard utility found" >&2
         return 1
     fi
+
+    [ -z "$q" ] && _clip_progress_clear
+    return $rc
 }
 
 # Usage: clip <file> | clip <command> [args...] | <cmd> | clip
 clip() {
+    # ── Piped input (streaming-friendly) ──
     if [ $# -eq 0 ]; then
         if [ -t 0 ]; then
             echo "Usage: clip <file> | clip <command> [args...] | <cmd> | clip"
             return 1
         fi
-        # Piped input: print each line immediately and refresh the clipboard
-        # as lines arrive, so Ctrl-C still leaves everything copied so far.
-        local content="" line
-        while IFS= read -r line || [ -n "$line" ]; do
-            printf '%s\n' "$line"
-            content+="$line"$'\n'
-            _clip_copy "$content" >/dev/null 2>&1
+        local tmp line n=0 interrupted=0 last=$SECONDS rc size
+        tmp=$(mktemp) || return 1
+        exec 3>>"$tmp"
+        trap 'interrupted=1' INT
+
+        while [ "$interrupted" -eq 0 ] && { IFS= read -r line || [ -n "$line" ]; }; do
+            printf '%s\n' "$line" >&3
+            n=$((n + 1))
+            if [ "$n" -eq 1 ] || [ $((n % 20)) -eq 0 ]; then
+                _clip_spinner "$n" "Streaming… $n lines, $(( $(wc -c <"$tmp") / 1024 )) KB"
+            fi
+            # Refresh the clipboard every ~2s so partial results are never lost
+            if [ $((SECONDS - last)) -ge 2 ]; then
+                _clip_send_file "$tmp" quiet
+                last=$SECONDS
+            fi
         done
-        echo "✓ Copied piped input to clipboard" >&2
-        return 0
+
+        trap - INT
+        exec 3>&-
+        _clip_progress_clear
+
+        # Stream ended (or was interrupted): total is known now, final copy with bar
+        _clip_send_file "$tmp"
+        rc=$?
+        size=$(wc -c <"$tmp" | tr -d ' ')
+        rm -f "$tmp"
+        if [ "$rc" -ne 0 ]; then
+            echo "Error: Failed to copy piped input" >&2
+        elif [ "$interrupted" -eq 1 ]; then
+            echo "✓ Interrupted. Copied $n lines so far ($(( size / 1024 )) KB)" >&2
+            return 130
+        else
+            echo "✓ Copied piped input to clipboard ($n lines, $(( size / 1024 )) KB)" >&2
+        fi
+        return $rc
     fi
 
+    # ── Decide: file or command ──
     local is_file=0
     if [ $# -eq 1 ] && [ -f "$1" ] && [ -r "$1" ]; then
         is_file=1
@@ -156,31 +245,10 @@ clip() {
         return 1
     fi
 
-    local content rc
-
+    # ── File mode ──
     if [ "$is_file" -eq 1 ]; then
-        if [[ "$OSTYPE" == "darwin"* ]]; then
-            pbcopy < "$1"; rc=$?
-        elif [ -n "$SSH_CONNECTION" ] || [ -n "$SSH_CLIENT" ] || [ -n "$SSH_TTY" ]; then
-            local b64
-            b64=$(base64 < "$1" | tr -d '\n')
-            rc=$?
-            if [ -n "$TMUX" ]; then
-                printf '\033Ptmux;\033\033]52;c;%s\a\033\\' "$b64" > /dev/tty
-            else
-                printf '\033]52;c;%s\a' "$b64" > /dev/tty
-            fi
-        elif command -v xclip &> /dev/null; then
-            xclip -selection clipboard < "$1"; rc=$?
-        elif command -v xsel &> /dev/null; then
-            xsel --clipboard --input < "$1"; rc=$?
-        elif command -v wl-copy &> /dev/null; then
-            wl-copy < "$1"; rc=$?
-        else
-            echo "Error: No clipboard utility found" >&2
-            return 1
-        fi
-
+        _clip_send_file "$1"
+        local rc=$?
         if [ "$rc" -ne 0 ]; then
             echo "Error: Failed to copy '$1'" >&2
             return 1
@@ -189,22 +257,57 @@ clip() {
         return 0
     fi
 
-    content=$("$@" 2>&1)
+    # ── Command mode (streaming-friendly) ──
+    [ -n "$ZSH_VERSION" ] && setopt local_options no_monitor no_notify
+    local tmp pid rc i=0 interrupted=0 last=$SECONDS
+    tmp=$(mktemp) || return 1
+
+    trap 'interrupted=1' INT
+    { "$@" >"$tmp" 2>&1 & } 2>/dev/null
+    pid=$!
+
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$interrupted" -eq 1 ]; then
+            kill "$pid" 2>/dev/null
+            break
+        fi
+        _clip_spinner "$i" "Running '$*'… $(( $(wc -c <"$tmp") / 1024 )) KB captured"
+        i=$((i + 1))
+        # Refresh the clipboard every ~2s with output captured so far
+        if [ $((SECONDS - last)) -ge 2 ]; then
+            _clip_send_file "$tmp" quiet
+            last=$SECONDS
+        fi
+        sleep 0.1
+    done
+
+    wait "$pid" 2>/dev/null
     rc=$?
+    trap - INT
+    _clip_progress_clear
+
+    if [ "$interrupted" -eq 1 ]; then
+        _clip_send_file "$tmp"
+        rm -f "$tmp"
+        echo "✓ Interrupted. Copied output so far to clipboard" >&2
+        return 130
+    fi
+
     if [ "$rc" -ne 0 ]; then
         echo "Error: Command failed" >&2
-        echo "$content" >&2
+        cat "$tmp" >&2
+        rm -f "$tmp"
         return 1
     fi
 
-    _clip_copy "$content"
+    _clip_send_file "$tmp"
     rc=$?
+    rm -f "$tmp"
     if [ "$rc" -eq 0 ]; then
         echo "✓ Copied output of '$*' to clipboard"
     fi
     return $rc
 }
-
 
 #── PORT ────────────────────────────────────────────────
 
