@@ -89,19 +89,46 @@ git_test() {
 alias tree="command tree -I 'node_modules|dist|.git|.next|.gitignore|.DS_Store|.env|.env.local|.cache|.vscode|.idea|coverage|build|out|tmp|.turbo|.eslintcache'"
 
 #── Functions ────────────────────────────────────────────────
+# ── clip ─────────────────────────────────────────────────
 
-# Rewrite a trailing "| clip" into "|& clip" so stderr (e.g. ssh -vvv) is piped too
-_clip_accept_line() {
-    local suffix='| clip'
-    if [[ $BUFFER == *"$suffix" ]]; then
-        BUFFER="${BUFFER%"$suffix"}|& clip"
+# zsh only: rewrite a trailing "| clip" into "|& clip" so stderr is piped too.
+# In bash, type "|& clip" yourself if you want stderr.
+if [ -n "$ZSH_VERSION" ]; then
+    _clip_accept_line() {
+        local suffix='| clip'
+        if [[ $BUFFER == *"$suffix" ]]; then
+            BUFFER="${BUFFER%"$suffix"}|& clip"
+        fi
+        zle .accept-line
+    }
+    zle -N accept-line _clip_accept_line
+fi
+
+_clip_copy() {
+    local content="$1"
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        printf '%s' "$content" | pbcopy
+    elif [ -n "$SSH_CONNECTION" ] || [ -n "$SSH_CLIENT" ] || [ -n "$SSH_TTY" ]; then
+        local b64
+        b64=$(printf '%s' "$content" | base64 | tr -d '\n')
+        if [ -n "$TMUX" ]; then
+            printf '\033Ptmux;\033\033]52;c;%s\a\033\\' "$b64" > /dev/tty
+        else
+            printf '\033]52;c;%s\a' "$b64" > /dev/tty
+        fi
+    elif command -v xclip &> /dev/null; then
+        printf '%s' "$content" | xclip -selection clipboard
+    elif command -v xsel &> /dev/null; then
+        printf '%s' "$content" | xsel --clipboard --input
+    elif command -v wl-copy &> /dev/null; then
+        printf '%s' "$content" | wl-copy
+    else
+        echo "Error: No clipboard utility found" >&2
+        return 1
     fi
-    zle .accept-line
 }
-zle -N accept-line _clip_accept_line
 
 # Usage: clip <file> | clip <command> [args...] | <cmd> | clip
-# NOTE: keep your existing _clip_copy function defined (unchanged)
 clip() {
     if [ $# -eq 0 ]; then
         if [ -t 0 ]; then
@@ -112,7 +139,7 @@ clip() {
         # as lines arrive, so Ctrl-C still leaves everything copied so far.
         local content="" line
         while IFS= read -r line || [ -n "$line" ]; do
-            print -r -- "$line"
+            printf '%s\n' "$line"
             content+="$line"$'\n'
             _clip_copy "$content" >/dev/null 2>&1
         done
@@ -178,29 +205,7 @@ clip() {
     return $rc
 }
 
-_clip_copy() {
-    local content="$1"
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        printf '%s' "$content" | pbcopy
-    elif [ -n "$SSH_CONNECTION" ] || [ -n "$SSH_CLIENT" ] || [ -n "$SSH_TTY" ]; then
-        local b64
-        b64=$(printf '%s' "$content" | base64 | tr -d '\n')
-        if [ -n "$TMUX" ]; then
-            printf '\033Ptmux;\033\033]52;c;%s\a\033\\' "$b64" > /dev/tty
-        else
-            printf '\033]52;c;%s\a' "$b64" > /dev/tty
-        fi
-    elif command -v xclip &> /dev/null; then
-        printf '%s' "$content" | xclip -selection clipboard
-    elif command -v xsel &> /dev/null; then
-        printf '%s' "$content" | xsel --clipboard --input
-    elif command -v wl-copy &> /dev/null; then
-        printf '%s' "$content" | wl-copy
-    else
-        echo "Error: No clipboard utility found" >&2
-        return 1
-    fi
-}
+
 #── PORT ────────────────────────────────────────────────
 
 kill_port() {
