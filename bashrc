@@ -85,20 +85,87 @@ gittest() {
   ssh -T git@github.com
 }
 
-sshadd() {
-  if [[ -z "$1" ]]; then
-    echo "Usage: sshadd <path-to-private-key>"
-    return 1
-  fi
+gitadd() {
+  local key="$HOME/.ssh/fd" arg_name="fadedreams" arg_email="fadedreams7@gmail.com"
 
-  local key="${1/#\~/$HOME}"   # expands a leading ~ if you pass it quoted
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -name)
+        [[ -z "$2" ]] && { echo "-name needs a value"; return 1; }
+        arg_name="$2"; shift 2 ;;
+      -email)
+        [[ -z "$2" ]] && { echo "-email needs a value"; return 1; }
+        arg_email="$2"; shift 2 ;;
+      -ssh_private)
+        [[ -z "$2" ]] && { echo "-ssh_private needs a path"; return 1; }
+        key="$2"; shift 2 ;;
+      -*)
+        echo "Unknown option: $1"
+        echo "Usage: gitadd [KEY_PATH | -ssh_private KEY_PATH] [-name NAME] [-email EMAIL]"
+        return 1 ;;
+      *)
+        key="$1"; shift ;;   # bare argument = key path
+    esac
+  done
+
+  key="${key/#\~/$HOME}"   # expands a leading ~ if you pass it quoted
 
   if [[ ! -f "$key" ]]; then
     echo "Key not found: $key"
     return 1
   fi
 
-  eval "$(ssh-agent -s)" && ssh-add -k "$key"
+  eval "$(ssh-agent -s)" && ssh-add -k "$key" || return 1
+
+  git config --global user.name "$arg_name"
+  git config --global user.email "$arg_email"
+
+  gitme
+}
+
+gitremove() {
+  local key="$HOME/.ssh/fd"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -ssh_private)
+        [[ -z "$2" ]] && { echo "-ssh_private needs a path"; return 1; }
+        key="$2"; shift 2 ;;
+      -*)
+        echo "Unknown option: $1"
+        echo "Usage: gitremove [KEY_PATH | -ssh_private KEY_PATH]"
+        return 1 ;;
+      *)
+        key="$1"; shift ;;   # bare argument = key path
+    esac
+  done
+
+  key="${key/#\~/$HOME}"   # expands a leading ~ if you pass it quoted
+
+  if [[ ! -f "$key" ]]; then
+    echo "Key not found: $key"
+    return 1
+  fi
+
+  # Remove the key from the running ssh-agent
+  if [[ -n "$SSH_AUTH_SOCK" ]]; then
+    ssh-add -d "$key"
+
+    # If no identities are left, stop the agent too
+    ssh-add -l >/dev/null 2>&1
+    if [[ $? -eq 1 && -n "$SSH_AGENT_PID" ]]; then
+      eval "$(ssh-agent -k)" >/dev/null && echo "ssh-agent stopped."
+    fi
+  else
+    echo "No ssh-agent running, skipping key removal."
+  fi
+
+  # Remove the global git identity
+  git config --global --unset user.name
+  git config --global --unset user.email
+  echo "Global git user.name and user.email removed."
+
+  gitme
 }
 
 gitme() {
@@ -115,7 +182,6 @@ gitme() {
   echo "Email:  ${email:-<not set>}"
   echo "Source: $(git config --show-origin --get user.email | cut -f1)"
 }
-
 
 
 alias tree="command tree -I 'node_modules|dist|.git|.next|.gitignore|.DS_Store|.env|.env.local|.cache|.vscode|.idea|coverage|build|out|tmp|.turbo|.eslintcache'"
