@@ -80,10 +80,42 @@ alias gp='git push'
 alias gl='git log --oneline --decorate --graph'
 alias gla='git log --oneline --decorate --graph --all'
 
-git_test() {
+gittest() {
   ssh-add ~/.ssh/fd 2>/dev/null
   ssh -T git@github.com
 }
+
+sshadd() {
+  if [[ -z "$1" ]]; then
+    echo "Usage: sshadd <path-to-private-key>"
+    return 1
+  fi
+
+  local key="${1/#\~/$HOME}"   # expands a leading ~ if you pass it quoted
+
+  if [[ ! -f "$key" ]]; then
+    echo "Key not found: $key"
+    return 1
+  fi
+
+  eval "$(ssh-agent -s)" && ssh-add -k "$key"
+}
+
+gitme() {
+  local name email
+  name=$(git config user.name)
+  email=$(git config user.email)
+
+  if [[ -z "$name" && -z "$email" ]]; then
+    echo "No git user configured."
+    return 1
+  fi
+
+  echo "Name:   ${name:-<not set>}"
+  echo "Email:  ${email:-<not set>}"
+  echo "Source: $(git config --show-origin --get user.email | cut -f1)"
+}
+
 
 
 alias tree="command tree -I 'node_modules|dist|.git|.next|.gitignore|.DS_Store|.env|.env.local|.cache|.vscode|.idea|coverage|build|out|tmp|.turbo|.eslintcache'"
