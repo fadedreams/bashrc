@@ -85,8 +85,11 @@ gittest() {
   ssh -T git@github.com
 }
 
+# gitadd ~/.ssh/fd
+# gitadd -ssh_private ~/.ssh/fd
+# gitadd -ssh_private ~/.ssh/fd -name "Other" -email other@example.com
 gitadd() {
-  local key="$HOME/.ssh/fd" arg_name="fadedreams" arg_email="fadedreams7@gmail.com"
+  local key="" arg_name="fadedreams" arg_email="fadedreams7@gmail.com"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -108,62 +111,20 @@ gitadd() {
     esac
   done
 
-  key="${key/#\~/$HOME}"   # expands a leading ~ if you pass it quoted
+  # Only touch ssh if a key was given
+  if [[ -n "$key" ]]; then
+    key="${key/#\~/$HOME}"   # expands a leading ~ if you pass it quoted
 
-  if [[ ! -f "$key" ]]; then
-    echo "Key not found: $key"
-    return 1
+    if [[ ! -f "$key" ]]; then
+      echo "Key not found: $key"
+      return 1
+    fi
+
+    eval "$(ssh-agent -s)" && ssh-add -k "$key" || return 1
   fi
-
-  eval "$(ssh-agent -s)" && ssh-add -k "$key" || return 1
 
   git config --global user.name "$arg_name"
   git config --global user.email "$arg_email"
-
-  gitme
-}
-
-gitremove() {
-  local key="$HOME/.ssh/fd"
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -ssh_private)
-        [[ -z "$2" ]] && { echo "-ssh_private needs a path"; return 1; }
-        key="$2"; shift 2 ;;
-      -*)
-        echo "Unknown option: $1"
-        echo "Usage: gitremove [KEY_PATH | -ssh_private KEY_PATH]"
-        return 1 ;;
-      *)
-        key="$1"; shift ;;   # bare argument = key path
-    esac
-  done
-
-  key="${key/#\~/$HOME}"   # expands a leading ~ if you pass it quoted
-
-  if [[ ! -f "$key" ]]; then
-    echo "Key not found: $key"
-    return 1
-  fi
-
-  # Remove the key from the running ssh-agent
-  if [[ -n "$SSH_AUTH_SOCK" ]]; then
-    ssh-add -d "$key"
-
-    # If no identities are left, stop the agent too
-    ssh-add -l >/dev/null 2>&1
-    if [[ $? -eq 1 && -n "$SSH_AGENT_PID" ]]; then
-      eval "$(ssh-agent -k)" >/dev/null && echo "ssh-agent stopped."
-    fi
-  else
-    echo "No ssh-agent running, skipping key removal."
-  fi
-
-  # Remove the global git identity
-  git config --global --unset user.name
-  git config --global --unset user.email
-  echo "Global git user.name and user.email removed."
 
   gitme
 }
@@ -187,6 +148,7 @@ gitme() {
 alias tree="command tree -I 'node_modules|dist|.git|.next|.gitignore|.DS_Store|.env|.env.local|.cache|.vscode|.idea|coverage|build|out|tmp|.turbo|.eslintcache'"
 
 #── Functions ────────────────────────────────────────────────
+
 # ── clip / clip_show (works in zsh and bash) ─────────────
 
 # zsh only: rewrite a trailing "| clip" or "| clip_show" into "|& ..." so
@@ -566,26 +528,36 @@ ssh_port_forward() {
 
 kill_process() {
     if [ -z "$1" ]; then
-        echo "Usage: killprocess <process_name>"
-        echo "Example: killprocess v2ray"
+        echo "Usage: kill_process <process_name>"
+        echo "Example: kill_process v2ray"
         return 1
     fi
+
     local process_name="$1"
+
     if ! pgrep -x "$process_name" > /dev/null && ! pgrep -f "$process_name" > /dev/null; then
         echo "No processes found matching: $process_name"
         return 0
     fi
+
     echo "Found processes matching '$process_name':"
     ps aux | grep -i "$process_name" | grep -v grep
     echo ""
+
     echo "Killing all processes matching '$process_name'..."
     killall -9 "$process_name" 2>/dev/null
-    if [ $? -eq 0 ]; then
-        echo "✓ Successfully killed processes"
+    pkill -9 -f "$process_name" 2>/dev/null
+
+    sleep 0.5
+    if pgrep -f "$process_name" > /dev/null; then
+        echo "✗ Some processes are still running (you may need sudo):"
+        pgrep -fa "$process_name"
+        return 1
     else
-        echo "✓ Processes killed"
+        echo "✓ Successfully killed processes"
     fi
 }
+alias killprocess='kill_process'
 
 find_process() {
     if [ -z "$1" ]; then
@@ -787,6 +759,36 @@ kill_pacman() {
 
 
 #── PROXY ────────────────────────────────────────────────
+# Ensure local addresses bypass the proxy (keeps existing entries, no duplicates)
+_set_no_proxy() {
+  local base="${NO_PROXY:-$no_proxy}" item
+  for item in localhost 127.0.0.1 ::1; do
+    case ",$base," in
+      *",$item,"*) ;;
+      *) base="${base:+$base,}$item" ;;
+    esac
+  done
+  export NO_PROXY="$base" no_proxy="$base"
+}
+
+# Clear proxy variables but KEEP NO_PROXY / no_proxy so localhost always bypasses
+_clear_proxy_vars() {
+  unset ALL_PROXY all_proxy \
+        HTTP_PROXY http_proxy \
+        HTTPS_PROXY https_proxy \
+        FTP_PROXY ftp_proxy
+  _set_no_proxy
+}
+
+# Export one proxy URL (or separate http/all URLs) in both upper and lower case
+# Usage: _export_proxy_vars <http_url> <https_url> <all_url>
+_export_proxy_vars() {
+  export HTTP_PROXY="$1"  http_proxy="$1" \
+         HTTPS_PROXY="$2" https_proxy="$2" \
+         ALL_PROXY="$3"   all_proxy="$3"
+  _set_no_proxy
+}
+
 function ssh() {
     if [[ "$TERM" == "xterm-ghostty" ]]; then
         TERM=xterm-256color command ssh "$@"
@@ -803,7 +805,7 @@ set_ssh_terminal() {
   local sock="$HOME/.ssh/proxy-${target//[^a-zA-Z0-9]/_}.sock"
 
   if [[ "$target" != *@* ]]; then
-    echo "Usage: proxy user@host [port]"
+    echo "Usage: set_ssh_terminal user@host [port]"
     return 1
   fi
 
@@ -816,10 +818,7 @@ set_ssh_terminal() {
       "$target" || { echo "Failed to start tunnel"; return 1; }
   fi
 
-  export ALL_PROXY="$url" all_proxy="$url" \
-         HTTP_PROXY="$url" http_proxy="$url" \
-         HTTPS_PROXY="$url" https_proxy="$url" \
-         NO_PROXY="localhost,127.0.0.1,::1" no_proxy="localhost,127.0.0.1,::1"
+  _export_proxy_vars "$url" "$url" "$url"
 
   echo "This terminal now goes through $target (socks5h://127.0.0.1:$port)"
 }
@@ -885,10 +884,10 @@ set_ssh_port() {
   if [[ "$port" == "off" || "$port" == "stop" ]]; then
     local p="$2"
     sock="$HOME/.ssh/sshport-${p}.sock"
-    unset ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy NO_PROXY no_proxy
+    _clear_proxy_vars
     ssh -S "$sock" -O exit dummy 2>/dev/null \
-      && echo "Tunnel on port $p stopped, env vars cleared" \
-      || echo "No tunnel on port $p, env vars cleared"
+      && echo "Tunnel on port $p stopped, proxy vars cleared" \
+      || echo "No tunnel on port $p, proxy vars cleared"
     return
   fi
 
@@ -908,15 +907,12 @@ set_ssh_port() {
       "$target" || { echo "Failed to start tunnel (is port $port in use?)"; return 1; }
   fi
 
-  export ALL_PROXY="$url" all_proxy="$url" \
-         HTTP_PROXY="$url" http_proxy="$url" \
-         HTTPS_PROXY="$url" https_proxy="$url" \
-         NO_PROXY="localhost,127.0.0.1,::1" no_proxy="localhost,127.0.0.1,::1"
+  _export_proxy_vars "$url" "$url" "$url"
 
   echo "SOCKS5 on 127.0.0.1:$port via $target (this terminal is using it)"
 }
 
-# Undo everything from proxy, set_ssh_port and set_ssh_all: unset_ssh
+# Undo everything from set_ssh_terminal, set_ssh_port and set_ssh_all: unset_ssh
 unset_ssh() {
   local pidfile="/tmp/set_ssh_all.pid"
   local sock count=0
@@ -928,7 +924,7 @@ unset_ssh() {
     echo "Stopped system-wide tunnel (set_ssh_all)"
   fi
 
-  # 2) Close every SOCKS tunnel (set_ssh_port and proxy)
+  # 2) Close every SOCKS tunnel (set_ssh_port and set_ssh_terminal)
   while IFS= read -r sock; do
     [[ -n "$sock" ]] || continue
     if ssh -S "$sock" -O exit dummy 2>/dev/null; then
@@ -938,8 +934,8 @@ unset_ssh() {
     rm -f "$sock"   # remove stale sockets too
   done < <(find "$HOME/.ssh" -maxdepth 1 \( -name 'sshport-*.sock' -o -name 'proxy-*.sock' \) 2>/dev/null)
 
-  # 3) Clear proxy variables in this terminal
-  unset ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy NO_PROXY no_proxy
+  # 3) Clear proxy variables in this terminal (NO_PROXY keeps localhost)
+  _clear_proxy_vars
   echo "Proxy env vars cleared in this terminal ($count SOCKS tunnel(s) closed)"
 }
 
@@ -950,7 +946,7 @@ set_ssh_proxy_jump() {
 
     if [ -z "$vps1" ] || [ -z "$vps2" ]; then
         echo "Error: Please provide both VPS user@ip"
-        echo "Usage: set_ssh_proxy <user1@vps1_ip> <user2@vps2_ip>"
+        echo "Usage: set_ssh_proxy_jump <user1@vps1_ip> <user2@vps2_ip>"
         return 1
     fi
 
@@ -992,13 +988,13 @@ set_terminal_proxy_socks() {
             port="$2"
             ;;
         *)
-            echo "Usage: set_terminal_socks [host] <port>"
-            echo "   or: set_terminal_socks <host:port>"
+            echo "Usage: set_terminal_proxy_socks [host] <port>"
+            echo "   or: set_terminal_proxy_socks <host:port>"
             echo "Default host: $default_host"
             echo "Examples:"
-            echo "  set_terminal_socks 1080"
-            echo "  set_terminal_socks 192.168.1.10 1080"
-            echo "  set_terminal_socks 127.0.0.1:1080"
+            echo "  set_terminal_proxy_socks 1080"
+            echo "  set_terminal_proxy_socks 192.168.1.10 1080"
+            echo "  set_terminal_proxy_socks 127.0.0.1:1080"
             return 1
             ;;
     esac
@@ -1011,36 +1007,40 @@ set_terminal_proxy_socks() {
         return 1
     fi
 
-    export http_proxy="socks5h://$host:$port"
-    export https_proxy="socks5h://$host:$port"
-    export ALL_PROXY="socks5h://$host:$port"
+    local url="socks5h://$host:$port"
+    _export_proxy_vars "$url" "$url" "$url"
 
-    echo "✓ Terminal proxy set to socks5h://$host:$port"
+    echo "Terminal proxy set to $url"
 }
 
+# set_terminal_proxy_http 7890   (host defaults to 127.0.0.1)
+set_terminal_proxy_http() {
+    local host="127.0.0.1" port
+    case "$#" in
+        1) port="$1" ;;
+        2) host="$1"; port="$2" ;;
+        *) echo "Usage: set_terminal_proxy_http [host] <port>"; return 1 ;;
+    esac
+    local url="http://$host:$port"
+    _export_proxy_vars "$url" "$url" ""
+    unset ALL_PROXY all_proxy
+    echo "Terminal proxy set to $url"
+}
 
 set_terminal_proxy_v2raya() {
-    export http_proxy="http://127.0.0.1:20171"
-    export https_proxy="http://127.0.0.1:20171"
-    export all_proxy="socks5h://127.0.0.1:20170"
+    _export_proxy_vars "http://127.0.0.1:20171" "http://127.0.0.1:20171" "socks5h://127.0.0.1:20170"
 }
 
 set_terminal_proxy_v2rayn() {
-    export http_proxy="http://127.0.0.1:10808"
-    export https_proxy="http://127.0.0.1:10808"
-    export all_proxy="socks5://127.0.0.1:10808"
+    _export_proxy_vars "http://127.0.0.1:10808" "http://127.0.0.1:10808" "socks5://127.0.0.1:10808"
 }
 
 set_terminal_proxy_hiddify() {
-    export http_proxy="http://127.0.0.1:12334"
-    export https_proxy="http://127.0.0.1:12334"
-    export all_proxy="socks5://127.0.0.1:12334"
+    _export_proxy_vars "http://127.0.0.1:12334" "http://127.0.0.1:12334" "socks5://127.0.0.1:12334"
 }
 
 set_terminal_proxy_mhm() {
-    export http_proxy="socks5://127.0.0.1:8085"
-    export https_proxy="socks5://127.0.0.1:8085"
-    export all_proxy="socks5://127.0.0.1:8085"
+    _export_proxy_vars "socks5://127.0.0.1:8085" "socks5://127.0.0.1:8085" "socks5://127.0.0.1:8085"
 }
 
 function ssh_proxy_v2rayn() {
@@ -1051,11 +1051,11 @@ function ssh_proxy_v2raya() {
     /usr/bin/ssh -o "ProxyCommand=nc -X 5 -x 127.0.0.1:20170 %h %p" "$1"
 }
 
-# Clear proxy variables set by the v2rayA / v2rayN / Hiddify functions (and any others)
+# Clear proxy variables set by the v2rayA / v2rayN / Hiddify / socks functions (and any others)
+# NO_PROXY / no_proxy are kept (with localhost, 127.0.0.1, ::1) so local services keep working
 unset_terminal_proxy() {
-  unset http_proxy https_proxy all_proxy ftp_proxy no_proxy \
-        HTTP_PROXY HTTPS_PROXY ALL_PROXY FTP_PROXY NO_PROXY
-  echo "Terminal proxy variables cleared"
+  _clear_proxy_vars
+  echo "Terminal proxy variables cleared (NO_PROXY=$NO_PROXY)"
 }
 
 # Clear everything: SSH tunnels, sshuttle, and all proxy variables
@@ -1071,18 +1071,14 @@ function vnc-tunnel() {
         echo "Example: vnc-tunnel 95.182.100.214"
         return 1
     fi
-    echo "🔒 Starting VNC tunnel to $1..."
+    echo "Starting VNC tunnel to $1..."
     echo "Then connect TigerVNC to localhost:1 (not the remote IP)."
     ssh -o ProxyCommand="nc -X 5 -x 127.0.0.1:1080 %h %p" \
         -L 5901:localhost:5901 \
         -N root@$1
 }
 
-function unset_terminal_proxy() {
-    unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy NO_PROXY no_proxy
-}
-
-# check_share_proxy 192.168.1.5 8080  #for check_share_proxy
+# check_shared_proxy 192.168.1.5 8080
 check_shared_proxy() {
   local host="${1:-192.168.1.2}"
   local port="${2:-10808}"
@@ -1127,13 +1123,13 @@ _detect_port_protocol() {
     banner=$( (sleep 1) | nc -w 2 "$host" "$port" 2>/dev/null \
               | head -c 80 | tr -cd '[:print:]\n' | head -1)
     case "$banner" in
-      SSH-*)        found+=("SSH") ;;
+      SSH-*)             found+=("SSH") ;;
       220*FTP*|220*ftp*) found+=("FTP") ;;
-      220*)         found+=("SMTP/FTP (banner: ${banner:0:40})") ;;
-      RFB*)         found+=("VNC") ;;
+      220*)              found+=("SMTP/FTP (banner: ${banner:0:40})") ;;
+      RFB*)              found+=("VNC") ;;
       *mysql*|*MariaDB*) found+=("MySQL/MariaDB") ;;
-      "")           ;;
-      *)            found+=("Unknown (banner: ${banner:0:40})") ;;
+      "")                ;;
+      *)                 found+=("Unknown (banner: ${banner:0:40})") ;;
     esac
   fi
 
@@ -1198,6 +1194,29 @@ scan_shared_proxy() {
   echo "Done: $found open port(s) on $host."
 }
 
+# test_proxy                    # defaults: 192.168.1.2 10808
+# test_proxy 192.168.1.2 10808
+# test_proxy 192.168.1.5 7890
+test_proxy() {
+  local host="${1:-192.168.1.2}"
+  local port="${2:-10808}"
+  local url="https://www.google.com"
+  local scheme code ok=1
+
+  echo "Testing proxy $host:$port -> $url ..."
+  for scheme in http socks5h socks5 socks4a; do
+    code=$(curl -s -o /dev/null -m 8 -w '%{http_code}' \
+           -x "$scheme://$host:$port" "$url" 2>/dev/null)
+    if [ -n "$code" ] && [ "$code" != "000" ]; then
+      echo "  OK:   $scheme (HTTP $code)"
+      ok=0
+    else
+      echo "  FAIL: $scheme"
+    fi
+  done
+
+  return $ok
+}
 
 brave_proxy() {
     brave --proxy-server="socks5://127.0.0.1:10808" "$@" &
@@ -1206,6 +1225,9 @@ brave_proxy() {
 thorium_proxy() {
     thorium-browser --proxy-server="socks5://127.0.0.1:10808" "$@" &
 }
+
+# Make sure local addresses bypass any proxy from the start of every shell
+_set_no_proxy
 
 
 #── WIFI ────────────────────────────────────────────────
@@ -1387,11 +1409,11 @@ ping_all() {
   return $failed
 }
 
-# scan_ssh_server 217.60.39.156 31.56.146.152 104.252.111.25      # user = root
-# scan_ssh_server ubuntu 217.60.39.156 31.56.146.152              # user = ubuntu
-# scan_ssh_server -u ubuntu 217.60.39.156 31.56.146.152:2222      # explicit user
-# scan_ssh_server -p 2222 217.60.39.156 31.56.146.152             # root, default port 2222
-scan_ssh_server() {
+# ssh_test 217.60.39.156 31.56.146.152 104.252.111.25      # user = root
+# ssh_test ubuntu 217.60.39.156 31.56.146.152              # user = ubuntu
+# ssh_test -u ubuntu 217.60.39.156 31.56.146.152:2222      # explicit user
+# ssh_test -p 2222 217.60.39.156 31.56.146.152             # root, default port 2222
+ssh_test() {
   local default_port=22 user=root user_set=0
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1661,19 +1683,3 @@ flush() {
 }
 
 #── FORMAT ────────────────────────────────────────────────
-
-clean_claude() {
-  local input="$1"
-  local output="${2:-cleaned.txt}"
-
-  if [ -z "$input" ]; then
-    echo "Usage: clean_claude <input_file> [output_file]"
-    return 1
-  fi
-
-  sed -e "s/<[^>]*>//g" \
-      -e $'s/\xe2\x80\x98/\'/g' \
-      -e $'s/\xe2\x80\x99/\'/g' \
-      "$input" > "$output"
-}
-
