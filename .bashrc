@@ -86,9 +86,25 @@ alias gla='git log --oneline --decorate --graph --all'
 
 # --- Docker -------------------------------------------------------------------
 
-alias dsa='docker stop $(docker ps -a -q)'
+alias dsa='docker stop -t 0 $(docker ps -q)'
 alias dps='docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"'
 alias dlogs='docker logs -f'
+#without graceful
+dka() {
+  local containers
+  containers=$(docker ps -q)
+  [ -n "$containers" ] && docker kill $containers
+}
+dda() {
+  local containers images
+  containers=$(docker ps -aq)
+  [ -n "$containers" ] && docker rm -f $containers
+
+  images=$(docker images -aq)
+  [ -n "$images" ] && docker rmi -f $images
+
+  docker system prune -a -f --volumes
+}
 
 # --- Network ------------------------------------------------------------------
 
