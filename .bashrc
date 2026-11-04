@@ -2507,5 +2507,5 @@ prof_rust() {
 #     notes in the chat reply.
 # ==============================================================================
 
-eval `ssh-agent -s`
-ssh-add -k ~/.ssh/fd
+#eval `ssh-agent -s`
+$ssh-add -k ~/.ssh/fd
