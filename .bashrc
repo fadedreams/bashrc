@@ -89,6 +89,10 @@ alias gla='git log --oneline --decorate --graph --all'
 alias dsa='docker stop -t 0 $(docker ps -q)'
 alias dps='docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"'
 alias dlogs='docker logs -f'
+dlogin() {
+  docker login -u "${1:-fadedreams7}"
+}
+
 #without graceful
 dka() {
   local containers
