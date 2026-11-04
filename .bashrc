@@ -635,6 +635,74 @@ check_port() {
     return $any_closed
 }
 
+# scan_port [port | START-END] ...
+#   Report which local ports are BUSY (listening) and which are FREE.
+#   scan_port                    # ports 1-10000
+#   scan_port 3000 8080 5432     # specific ports
+#   scan_port 3000-3010          # a range
+#   scan_port 80 443 8000-8100   # mix of both
+scan_port() {
+  local ports="" s busy
+  [ $# -eq 0 ] && set -- 1-10000
+
+  for s in "$@"; do
+    case "$s" in
+      *[!0-9-]*|""|-*|*-)
+        echo "scan_ports: invalid port or range '$s'" >&2; return 1 ;;
+      *-*) ports+=$'\n'"$(seq "${s%-*}" "${s#*-}")" ;;
+      *)   ports+=$'\n'"$s" ;;
+    esac
+  done
+  ports=$(printf '%s\n' "$ports" | sed '/^$/d' | sort -nu)
+
+  # Listening TCP/UDP sockets: "port proto process"
+  busy=$(sudo ss -Hltunp 2>/dev/null | awk '{
+      n = split($5, a, ":"); port = a[n]; proc = "-"
+      if (match($0, /users:\(\("[^"]*"/)) proc = substr($0, RSTART+9, RLENGTH-10)
+      print port, $1, proc }' | sort -n -u)
+
+  printf '%s\n' "$ports" | awk -v busy="$busy" '
+    BEGIN {
+      R = "\033[1;31m"; G = "\033[1;32m"; C = "\033[1;36m"; D = "\033[2m"; Z = "\033[0m"
+      n = split(busy, L, "\n")
+      for (i = 1; i <= n; i++) {
+        split(L[i], f, " "); if (f[1] == "") continue
+        if (f[1] in proto) { if (index(proto[f[1]], f[2]) == 0) proto[f[1]] = proto[f[1]] "," f[2] }
+        else { proto[f[1]] = f[2]; proc[f[1]] = f[3] }
+      }
+    }
+    function flush() {
+      if (start == "") return
+      free = free (free == "" ? "" : ", ") (start == prev ? start : start "-" prev)
+      start = ""
+    }
+    {
+      p = $1; total++
+      if (p in proto) {
+        flush(); nb++
+        brow = brow sprintf("  %s%-8s%s %-10s %s\n", R, p, Z, proto[p], proc[p])
+      } else {
+        nf++
+        if (start != "" && p == prev + 1) { prev = p }
+        else { flush(); start = p; prev = p }
+      }
+    }
+    END {
+      flush()
+      printf "\n%sScanned %d port(s): %s%d busy%s, %s%d free%s\n", C, total, R, nb, C, G, nf, Z
+      if (nb) {
+        printf "\n%sBUSY%s\n", R, Z
+        printf "  %s%-8s %-10s %s%s\n", D, "PORT", "PROTO", "PROCESS", Z
+        printf "%s", brow
+      }
+      if (nf) {
+        printf "\n%sFREE%s\n  %s\n", G, Z, free
+      }
+      print ""
+    }'
+}
+
+
 # ssh_port_forward <local_port:remote_port> <user@host>
 #   ssh_port_forward 8080:8080 m@5.161.157.120
 ssh_port_forward() {
