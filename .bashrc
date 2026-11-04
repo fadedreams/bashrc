@@ -3,6 +3,7 @@
 # ==============================================================================
 
 # --- General ------------------------------------------------------------------
+
 alias vi=vim
 alias py="python3"
 alias docker-compose="docker compose"
@@ -91,6 +92,23 @@ alias dps='docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"'
 alias dlogs='docker logs -f'
 dlogin() {
   docker login -u "${1:-fadedreams7}"
+}
+
+#without graceful
+dka() {
+  local containers
+  containers=$(docker ps -q)
+  [ -n "$containers" ] && docker kill $containers
+}
+dda() {
+  local containers images
+  containers=$(docker ps -aq)
+  [ -n "$containers" ] && docker rm -f $containers
+
+  images=$(docker images -aq)
+  [ -n "$images" ] && docker rmi -f $images
+
+  docker system prune -a -f --volumes
 }
 
 #without graceful
@@ -701,7 +719,6 @@ scan_port() {
       print ""
     }'
 }
-
 
 # ssh_port_forward <local_port:remote_port> <user@host>
 #   ssh_port_forward 8080:8080 m@5.161.157.120
@@ -2181,3 +2198,314 @@ pretty() {
   fi
 }
 
+
+# ==============================================================================
+# DEV TOOLS & PATH
+# ==============================================================================
+
+
+export PATH=$PATH:/usr/local/go/bin
+export PATH=$PATH:~/go/bin
+
+export NVM_DIR="$HOME/.config/nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
+
+export PATH="$HOME/.local/share/gem/ruby/3.4.0/bin:$PATH"
+
+eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv zsh)"
+
+[ -s "/home/m/.bun/_bun" ] && source "/home/m/.bun/_bun"
+
+. "$HOME/.local/share/../bin/env"
+
+export PATH="$PATH:/var/lib/snapd/snap/bin"
+
+export PATH=/home/m/.opencode/bin:$PATH
+
+export TERM=xterm-256color
+
+
+npmnc() {
+  npm install "$@" --cache /tmp/npm-cache
+}
+
+# ---------- Node: prof_node [-t seconds] node server.js ----------
+#prof_node node server.js            # default 15s window, then auto-stops
+
+#prof_node -t 30 node server.js      # 30s window
+
+#prof_node -t 0 node server.js       # no timer, press Ctrl+C once to finish (old behavior)
+
+#prof_node node --env-file=.env server.js   # extra node flags/args work too
+prof_node() {
+  if [ $# -eq 0 ]; then
+    echo "Usage: prof_node [-t seconds] node server.js [args...]   (default: run until Ctrl+C)" >&2
+    return 1
+  fi
+
+  local secs=0
+  if [ "$1" = "-t" ]; then secs="$2"; shift 2; fi
+
+  local cmd="$1"; shift
+  local ts; ts=$(date +%Y-%m-%d_%H-%M-%S)
+  local log="prof_node_$ts.log"
+  local out="report_node_$ts.txt"
+
+  "$cmd" --prof --logfile="$log" --no-logfile-per-isolate "$@" &
+  local pid=$!
+
+  local stopped=0 elapsed=0
+  trap 'stopped=1' INT
+
+  if [ "$secs" -gt 0 ]; then
+    echo ">>> Profiling for ${secs}s. Start your load test NOW. Ctrl+C ends early."
+  else
+    echo ">>> Profiling until you press Ctrl+C once."
+  fi
+
+  while kill -0 $pid 2>/dev/null && [ $stopped -eq 0 ]; do
+    if [ "$secs" -gt 0 ] && [ $elapsed -ge "$secs" ]; then break; fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  kill -INT $pid 2>/dev/null
+  wait $pid 2>/dev/null
+  trap '' INT   # ignore Ctrl+C while the report is built
+
+  if [ ! -s "$log" ]; then
+    trap - INT
+    echo "No profile was generated" >&2
+    return 1
+  fi
+
+  ( trap '' INT; "$cmd" --prof-process "$log" > "$out" 2>&1 )
+  trap - INT
+
+  if [ -s "$out" ]; then
+    rm -f "$log"
+    echo "Report: $out"
+    echo "--- Top (ticks) ---"
+    sed -n '1,25p' "$out"
+  else
+    echo "Report is empty, keeping $log" >&2
+    return 1
+  fi
+}
+
+# ---------- Go: prof_go [-t seconds] go run main.go | ./binary ----------
+#prof_go go run main.go          # default 15s window
+
+#prof_go -t 30 go run .          # 30s window
+
+#prof_go ./bottleneck-go         # pre-built binary
+
+#PPROF_PORT=6161 prof_go go run main.go   # if 6060 is taken
+prof_go() {
+  if [ $# -eq 0 ]; then
+    echo "Usage: prof_go [-t seconds] go run main.go | go run . | ./binary [args...]   (default: run until Ctrl+C)" >&2
+    return 1
+  fi
+
+  local secs=0 chunk=5
+  if [ "$1" = "-t" ]; then secs="$2"; shift 2; fi
+
+  local port="${PPROF_PORT:-6060}"
+  local ts; ts=$(date +%Y-%m-%d_%H-%M-%S)
+  local base="cpu_$ts"
+  local merged="$base.pb.gz"
+  local out="report_go_$ts.txt"
+
+  setsid "$@" &
+  local pid=$!
+  local stopped=0
+  trap 'stopped=1' INT
+
+  local i up=0
+  for i in $(seq 1 150); do
+    [ $stopped -eq 1 ] && break
+    if curl -s -o /dev/null "http://localhost:$port/debug/pprof/"; then up=1; break; fi
+    kill -0 $pid 2>/dev/null || break
+    sleep 0.2
+  done
+  if [ $up -eq 0 ]; then
+    kill -- -$pid 2>/dev/null; trap - INT
+    [ $stopped -eq 0 ] && echo "pprof endpoint on port $port never came up (is net/http/pprof imported?)" >&2
+    return 1
+  fi
+
+  if [ "$secs" -gt 0 ]; then
+    echo ">>> Profiling for ${secs}s. Start your load test NOW. Ctrl+C ends early."
+  else
+    echo ">>> Profiling until you press Ctrl+C once (up to ${chunk}s wait after that)."
+  fi
+
+  local elapsed=0 n=0 len rem f cpid
+  local chunks=()
+  while [ $stopped -eq 0 ] && kill -0 $pid 2>/dev/null; do
+    len=$chunk
+    if [ "$secs" -gt 0 ]; then
+      rem=$((secs - elapsed))
+      [ $rem -le 0 ] && break
+      [ $rem -lt $len ] && len=$rem
+    fi
+    f="${base}_part$n.pb.gz"
+    # setsid keeps curl out of the terminal's Ctrl+C, so the chunk finishes cleanly
+    setsid curl -s -o "$f" "http://localhost:$port/debug/pprof/profile?seconds=$len" &
+    cpid=$!
+    while kill -0 $cpid 2>/dev/null; do sleep 0.2; done
+    [ -s "$f" ] && chunks+=("$f")
+    elapsed=$((elapsed + len))
+    n=$((n + 1))
+  done
+
+  kill -- -$pid 2>/dev/null
+  wait $pid 2>/dev/null
+  trap '' INT
+
+  if [ ${#chunks[@]} -eq 0 ]; then
+    trap - INT
+    echo "No profile collected" >&2
+    return 1
+  fi
+
+  ( trap '' INT
+    go tool pprof -proto "${chunks[@]}" > "$merged" 2>/dev/null
+    go tool pprof -top -nodecount=25 "$merged" > "$out" 2>&1 )
+  trap - INT
+  rm -f "${chunks[@]}"
+
+  echo "Report: $out   Raw profile: $merged"
+  echo "--- Top functions ---"
+  sed -n '1,18p' "$out"
+}
+
+# ---------- Python: prof_py [-t seconds] python server.py ----------
+#prof_py python server.py                    # no timer, press Ctrl+C once to finish
+#prof_py -t 30 python server.py              # stops by itself after 30s
+#prof_py python3 server.py --port 8000       # python3 and script args work
+#prof_py ./venv/bin/python server.py         # use a venv's interpreter
+prof_py() {
+  if [ $# -eq 0 ]; then
+    echo "Usage: prof_py [-t seconds] python server.py [args...]   (default: run until Ctrl+C)" >&2
+    return 1
+  fi
+
+  local secs=0
+  if [ "$1" = "-t" ]; then secs="$2"; shift 2; fi
+
+  local cmd="$1"; shift
+  local ts; ts=$(date +%Y-%m-%d_%H-%M-%S)
+  local pb="prof_$ts.pstats"
+  local out="report_py_$ts.txt"
+
+  "$cmd" -m cProfile -o "$pb" "$@" &
+  local pid=$!
+
+  local stopped=0 elapsed=0
+  trap 'stopped=1' INT
+
+  if [ "$secs" -gt 0 ]; then
+    echo ">>> Profiling for ${secs}s. Start your load test NOW. Ctrl+C ends early."
+  else
+    echo ">>> Profiling until you press Ctrl+C once."
+  fi
+
+  while kill -0 $pid 2>/dev/null && [ $stopped -eq 0 ]; do
+    if [ "$secs" -gt 0 ] && [ $elapsed -ge "$secs" ]; then break; fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  kill -INT $pid 2>/dev/null
+  wait $pid 2>/dev/null
+  trap '' INT
+
+  if [ ! -s "$pb" ]; then
+    trap - INT
+    echo "No profile was generated" >&2
+    return 1
+  fi
+
+  ( trap '' INT
+    "$cmd" -c "import pstats,sys; pstats.Stats(sys.argv[1]).sort_stats('tottime').print_stats(25)" "$pb" > "$out" )
+  trap - INT
+
+  if [ -s "$out" ]; then
+    rm -f "$pb"
+    echo "Report: $out"
+    echo "--- Top functions (by tottime) ---"
+    grep -A 14 "ncalls" "$out"
+  else
+    echo "Report is empty, keeping $pb" >&2
+    return 1
+  fi
+}
+
+# ---------- Rust: prof_rust [-t seconds] cargo run --release | ./target/release/myserver ----------
+# Arch / Manjaro / EndeavourOS
+# sudo pacman -S perf
+#
+# # Debian / Ubuntu
+# sudo apt install linux-perf        # Debian
+# sudo apt install linux-tools-generic linux-tools-$(uname -r)   # Ubuntu
+#
+# # Fedora
+# sudo dnf install perf
+
+# ---------- Rust: prof_rust [-t seconds] ./target/release/myserver ----------
+#prof_rust ./target/release/bottleneck-rs            # no timer, press Ctrl+C once to finish
+#prof_rust -t 30 ./target/release/bottleneck-rs      # stops by itself after 30s (Ctrl+C ends early)
+#prof_rust ./target/release/myserver --port 8080     # extra args work too
+# Needs the PROF_REPORT + pprof + ctrlc code in the app's main.rs (see bottleneck-rs)
+prof_rust() {
+  if [ $# -eq 0 ]; then
+    echo "Usage: prof_rust [-t seconds] ./target/release/bin [args...]   (default: run until Ctrl+C)" >&2
+    return 1
+  fi
+
+  local secs=0
+  if [ "$1" = "-t" ]; then secs="$2"; shift 2; fi
+
+  if [ ! -x "$1" ]; then
+    echo "Not an executable: $1 (run cargo build --release first, and check your current folder)" >&2
+    return 1
+  fi
+
+  local ts; ts=$(date +%Y-%m-%d_%H-%M-%S)
+  local out="report_rust_$ts.txt"
+
+  if [ "$secs" -gt 0 ]; then
+    echo ">>> Profiling for ${secs}s. Start your load test NOW. Ctrl+C ends early."
+  else
+    echo ">>> Profiling until you press Ctrl+C once."
+  fi
+
+  # The function itself survives Ctrl+C; the app gets the signal, writes the report and exits
+  trap : INT
+  if [ "$secs" -gt 0 ]; then
+    PROF_REPORT="$out" timeout --foreground -s INT "$secs" "$@"
+  else
+    PROF_REPORT="$out" "$@"
+  fi
+  trap - INT
+
+  if [ -s "$out" ]; then
+    echo "Report: $out"
+    echo "--- Top functions (self time) ---"
+    sed -n '1,20p' "$out"
+  else
+    echo "No report was generated" >&2
+    return 1
+  fi
+}
+
+# ==============================================================================
+# SSH AGENT
+#     Starts a NEW agent in every shell. To reuse one agent instead, see the
+#     notes in the chat reply.
+# ==============================================================================
+
+eval `ssh-agent -s`
+ssh-add -k ~/.ssh/fd
