@@ -4,6 +4,7 @@
 
 # --- General ------------------------------------------------------------------
 
+alias v="nvim"
 alias vi=vim
 alias py="python3"
 alias docker-compose="docker compose"
@@ -90,16 +91,25 @@ alias gla='git log --oneline --decorate --graph --all'
 alias dsa='docker stop -t 0 $(docker ps -q)'
 alias dps='docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"'
 alias dlogs='docker logs -f'
-dlogin() {
+
+docker_login() {
   docker login -u "${1:-fadedreams7}"
 }
 
-#without graceful
-dka() {
-  local containers
-  containers=$(docker ps -q)
-  [ -n "$containers" ] && docker kill $containers
+docker_me() {
+  local registry="https://index.docker.io/v1/"
+  local helper
+  helper=$(jq -r '.credsStore // empty' ~/.docker/config.json 2>/dev/null)
+
+  if [ -n "$helper" ]; then
+    echo "$registry" | "docker-credential-$helper" get 2>/dev/null | jq -r '.Username // "not logged in"'
+  else
+    # no credential helper: creds are stored base64-encoded in config.json
+    jq -r --arg r "$registry" '.auths[$r].auth // empty' ~/.docker/config.json 2>/dev/null \
+      | base64 -d 2>/dev/null | cut -d: -f1
+  fi
 }
+
 dda() {
   local containers images
   containers=$(docker ps -aq)
@@ -652,6 +662,7 @@ check_port() {
 
     return $any_closed
 }
+alias cport='check_port'
 
 # scan_port [port | START-END] ...
 #   Report which local ports are BUSY (listening) and which are FREE.
@@ -740,38 +751,98 @@ ssh_port_forward() {
 
 # --- Processes ----------------------------------------------------------------
 
-kill_process() {
-    if [ -z "$1" ]; then
-        echo "Usage: kill_process <process_name>"
-        echo "Example: kill_process v2ray"
-        return 1
+# smart_kill php          # SIGTERM, then SIGKILL stragglers, then clear the ports
+# smart_kill -f php       # SIGKILL right away
+# smart_kill :5050        # only whatever is on port 5050
+# smart_kill -f :5050
+smart_kill() {
+  local force=0 target= line pid pt out
+  while [[ $# -gt 0 ]]; do
+    case $1 in -f|-9|--force) force=1 ;; *) target=$1 ;; esac
+    shift
+  done
+  if [[ -z $target ]]; then
+    echo "usage: smart_kill [-f] <name|:port>"
+    return 1
+  fi
+
+  local -a roots=() pids=() ports=()
+
+  # --- find root PIDs ---
+  if [[ $target == :* || $target =~ ^[0-9]+$ ]]; then
+    while IFS= read -r line; do [[ -n $line ]] && roots+=("$line"); done \
+      < <(lsof -t -nP -iTCP:"${target#:}" -sTCP:LISTEN 2>/dev/null)
+  else
+    while IFS= read -r line; do [[ -n $line ]] && roots+=("$line"); done \
+      < <({ pgrep -x "$target"; pgrep -f "^(\S*/)?$target(\s|\$)"; } 2>/dev/null)
+  fi
+
+  # --- add children recursively, dedupe, skip this shell ---
+  _sk_tree() {
+    local p c
+    for p in "$@"; do
+      echo "$p"
+      while IFS= read -r c; do [[ -n $c ]] && _sk_tree "$c"; done < <(pgrep -P "$p" 2>/dev/null)
+    done
+  }
+  if ((${#roots[@]})); then
+    while IFS= read -r line; do
+      [[ -n $line && $line != "$$" ]] && pids+=("$line")
+    done < <(_sk_tree "${roots[@]}" | sort -un)
+  fi
+  unset -f _sk_tree
+
+  if ((${#pids[@]} == 0)); then
+    echo "smart_kill: nothing found for '$target'"
+    return 0
+  fi
+
+  # --- show what we found + ports ---
+  printf '%-8s %-16s %s\n' PID NAME PORTS
+  for pid in "${pids[@]}"; do
+    out=$(lsof -a -p "$pid" -nP -iTCP -sTCP:LISTEN -Fn 2>/dev/null | sed -n 's/^n.*:\([0-9]*\)$/\1/p' | sort -u | tr '\n' ' ')
+    for pt in $out; do ports+=("$pt"); done
+    printf '%-8s %-16s %s\n' "$pid" "$(ps -o comm= -p "$pid")" "${out:--}"
+  done
+
+  # --- kill ---
+  if ((force)); then
+    kill -KILL "${pids[@]}" 2>/dev/null
+  else
+    kill -TERM "${pids[@]}" 2>/dev/null
+    sleep 1
+    local -a alive=()
+    for pid in "${pids[@]}"; do kill -0 "$pid" 2>/dev/null && alive+=("$pid"); done
+    if ((${#alive[@]})); then
+      echo "force-killing stragglers: ${alive[*]}"
+      kill -KILL "${alive[@]}" 2>/dev/null
     fi
+  fi
+  sleep 0.3
 
-    local process_name="$1"
-
-    if ! pgrep -x "$process_name" > /dev/null && ! pgrep -f "$process_name" > /dev/null; then
-        echo "No processes found matching: $process_name"
-        return 0
-    fi
-
-    echo "Found processes matching '$process_name':"
-    ps aux | grep -i "$process_name" | grep -v grep
-    echo ""
-
-    echo "Killing all processes matching '$process_name'..."
-    killall -9 "$process_name" 2>/dev/null
-    pkill -9 -f "$process_name" 2>/dev/null
-
-    sleep 0.5
-    if pgrep -f "$process_name" > /dev/null; then
-        echo "✗ Some processes are still running (you may need sudo):"
-        pgrep -fa "$process_name"
-        return 1
-    else
-        echo "✓ Successfully killed processes"
-    fi
+  # --- make sure ports are free; force-kill any remaining holder ---
+  local rc=0 holders
+  if ((${#ports[@]})); then
+    for pt in $(printf '%s\n' "${ports[@]}" | sort -un); do
+      holders=$(lsof -t -nP -iTCP:"$pt" -sTCP:LISTEN 2>/dev/null | tr '\n' ' ')
+      if [[ -n $holders ]]; then
+        echo "port $pt still held by: $holders-> force-killing"
+        kill -KILL $holders 2>/dev/null
+        sleep 0.3
+      fi
+      if lsof -t -nP -iTCP:"$pt" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "port $pt STILL in use (try sudo)"; rc=1
+      else
+        echo "port $pt freed"
+      fi
+    done
+  fi
+  echo "killed ${#pids[@]} process(es)"
+  return $rc
 }
-alias killprocess='kill_process'
+
+alias skill='smart_kill'
+alias kill_process='smart_kill'
 
 find_process() {
     if [ -z "$1" ]; then
@@ -2211,301 +2282,162 @@ export NVM_DIR="$HOME/.config/nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
 [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
 
-export PATH="$HOME/.local/share/gem/ruby/3.4.0/bin:$PATH"
-
-eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv zsh)"
-
-[ -s "/home/m/.bun/_bun" ] && source "/home/m/.bun/_bun"
-
-. "$HOME/.local/share/../bin/env"
-
-export PATH="$PATH:/var/lib/snapd/snap/bin"
-
-export PATH=/home/m/.opencode/bin:$PATH
 
 export TERM=xterm-256color
-
 
 npmnc() {
   npm install "$@" --cache /tmp/npm-cache
 }
 
-# ---------- Node: prof_node [-t seconds] node server.js ----------
-#prof_node node server.js            # default 15s window, then auto-stops
+toolv() {
+  local name cmd
 
-#prof_node -t 30 node server.js      # 30s window
+  # "label|command" pairs
+  local tools=(
+    "python|python3 --version"
+    "php|php --version"
+    "rust|rustc --version"
+    "cargo|cargo --version"
+    "java|java -version"
+    "ruby|ruby --version"
+    "c++|g++ --version"
+    "gcc|gcc --version"
+    "node|node --version"
+    "go|go version"
+  )
 
-#prof_node -t 0 node server.js       # no timer, press Ctrl+C once to finish (old behavior)
+  for entry in "${tools[@]}"; do
+    name="${entry%%|*}"
+    cmd="${entry#*|}"
 
-#prof_node node --env-file=.env server.js   # extra node flags/args work too
-prof_node() {
-  if [ $# -eq 0 ]; then
-    echo "Usage: prof_node [-t seconds] node server.js [args...]   (default: run until Ctrl+C)" >&2
-    return 1
-  fi
-
-  local secs=0
-  if [ "$1" = "-t" ]; then secs="$2"; shift 2; fi
-
-  local cmd="$1"; shift
-  local ts; ts=$(date +%Y-%m-%d_%H-%M-%S)
-  local log="prof_node_$ts.log"
-  local out="report_node_$ts.txt"
-
-  "$cmd" --prof --logfile="$log" --no-logfile-per-isolate "$@" &
-  local pid=$!
-
-  local stopped=0 elapsed=0
-  trap 'stopped=1' INT
-
-  if [ "$secs" -gt 0 ]; then
-    echo ">>> Profiling for ${secs}s. Start your load test NOW. Ctrl+C ends early."
-  else
-    echo ">>> Profiling until you press Ctrl+C once."
-  fi
-
-  while kill -0 $pid 2>/dev/null && [ $stopped -eq 0 ]; do
-    if [ "$secs" -gt 0 ] && [ $elapsed -ge "$secs" ]; then break; fi
-    sleep 1
-    elapsed=$((elapsed + 1))
-  done
-
-  kill -INT $pid 2>/dev/null
-  wait $pid 2>/dev/null
-  trap '' INT   # ignore Ctrl+C while the report is built
-
-  if [ ! -s "$log" ]; then
-    trap - INT
-    echo "No profile was generated" >&2
-    return 1
-  fi
-
-  ( trap '' INT; "$cmd" --prof-process "$log" > "$out" 2>&1 )
-  trap - INT
-
-  if [ -s "$out" ]; then
-    rm -f "$log"
-    echo "Report: $out"
-    echo "--- Top (ticks) ---"
-    sed -n '1,25p' "$out"
-  else
-    echo "Report is empty, keeping $log" >&2
-    return 1
-  fi
-}
-
-# ---------- Go: prof_go [-t seconds] go run main.go | ./binary ----------
-#prof_go go run main.go          # default 15s window
-
-#prof_go -t 30 go run .          # 30s window
-
-#prof_go ./bottleneck-go         # pre-built binary
-
-#PPROF_PORT=6161 prof_go go run main.go   # if 6060 is taken
-prof_go() {
-  if [ $# -eq 0 ]; then
-    echo "Usage: prof_go [-t seconds] go run main.go | go run . | ./binary [args...]   (default: run until Ctrl+C)" >&2
-    return 1
-  fi
-
-  local secs=0 chunk=5
-  if [ "$1" = "-t" ]; then secs="$2"; shift 2; fi
-
-  local port="${PPROF_PORT:-6060}"
-  local ts; ts=$(date +%Y-%m-%d_%H-%M-%S)
-  local base="cpu_$ts"
-  local merged="$base.pb.gz"
-  local out="report_go_$ts.txt"
-
-  setsid "$@" &
-  local pid=$!
-  local stopped=0
-  trap 'stopped=1' INT
-
-  local i up=0
-  for i in $(seq 1 150); do
-    [ $stopped -eq 1 ] && break
-    if curl -s -o /dev/null "http://localhost:$port/debug/pprof/"; then up=1; break; fi
-    kill -0 $pid 2>/dev/null || break
-    sleep 0.2
-  done
-  if [ $up -eq 0 ]; then
-    kill -- -$pid 2>/dev/null; trap - INT
-    [ $stopped -eq 0 ] && echo "pprof endpoint on port $port never came up (is net/http/pprof imported?)" >&2
-    return 1
-  fi
-
-  if [ "$secs" -gt 0 ]; then
-    echo ">>> Profiling for ${secs}s. Start your load test NOW. Ctrl+C ends early."
-  else
-    echo ">>> Profiling until you press Ctrl+C once (up to ${chunk}s wait after that)."
-  fi
-
-  local elapsed=0 n=0 len rem f cpid
-  local chunks=()
-  while [ $stopped -eq 0 ] && kill -0 $pid 2>/dev/null; do
-    len=$chunk
-    if [ "$secs" -gt 0 ]; then
-      rem=$((secs - elapsed))
-      [ $rem -le 0 ] && break
-      [ $rem -lt $len ] && len=$rem
+    if command -v "${cmd%% *}" >/dev/null 2>&1; then
+      # java prints to stderr; 2>&1 captures it. head -n1 keeps it to one line.
+      printf "%-8s %s\n" "$name" "$($cmd 2>&1 | head -n1)"
+    else
+      printf "%-8s %s\n" "$name" "not installed"
     fi
-    f="${base}_part$n.pb.gz"
-    # setsid keeps curl out of the terminal's Ctrl+C, so the chunk finishes cleanly
-    setsid curl -s -o "$f" "http://localhost:$port/debug/pprof/profile?seconds=$len" &
-    cpid=$!
-    while kill -0 $cpid 2>/dev/null; do sleep 0.2; done
-    [ -s "$f" ] && chunks+=("$f")
-    elapsed=$((elapsed + len))
-    n=$((n + 1))
+  done
+}
+
+# ---------- profx [-t seconds] [-l lang] <command...> ----------
+# One entry point for all profilers below. Flags go BEFORE the command.
+#   -t N      stop automatically after N seconds (default: run until Ctrl+C, press it once)
+#   -l LANG   force a language: node|go|py|php|java|rust|cpp
+# Auto-detected from the command: node, go, python*, php*, java.
+# Pre-built binaries: target/{release,debug}/ path -> rust, Go binary -> go, else -> cpp (perf).
+# Output: a report_<lang>_<timestamp>.txt in the current folder, plus the top lines on screen.
+# Start your load test as soon as the ">>> Profiling" line appears.
+
+# ---------- Node: _prof_node ----------
+# Install:  sudo pacman -S nodejs        # Arch
+#           sudo apt install nodejs      # Debian / Ubuntu
+#           sudo dnf install nodejs      # Fedora
+# Uses node's built-in --prof, nothing else needed.
+#   profx node server.js                          # until Ctrl+C
+#   profx -t 30 node server.js                    # 30s window
+#   profx node --env-file=.env server.js          # extra node flags/args work too
+#   profx -t 30 node --max-old-space-size=4096 server.js --port 3000
+
+# ---------- Go: _prof_go ----------
+# Install:  sudo pacman -S go | sudo apt install golang-go | sudo dnf install golang
+# Needs in your program:  import _ "net/http/pprof"  and an HTTP server on localhost:6060
+#   (or on $PPROF_PORT, see below). Also needs curl.
+#   profx go run main.go                          # until Ctrl+C
+#   profx -t 30 go run .                          # 30s window
+#   profx ./bottleneck-go                         # pre-built binary
+#   PPROF_PORT=6161 profx go run main.go          # if 6060 is taken (your code must listen on it too)
+# Output also keeps the raw profile (cpu_<ts>.pb.gz), open it with: go tool pprof -http=:8080 cpu_<ts>.pb.gz
+
+# ---------- Python: _prof_py ----------
+# Install:  sudo pacman -S python | sudo apt install python3 | sudo dnf install python3
+# Uses the built-in cProfile, nothing else needed. Report is sorted by self time (tottime).
+#   profx python server.py                        # until Ctrl+C
+#   profx -t 30 python3 server.py --port 8000     # 30s window, script args work
+#   profx ./venv/bin/python server.py             # use a venv's interpreter (packages come from the venv)
+# Wrappers like "uv run python" or "poetry run python" don't work, point at the venv's python directly.
+
+# ---------- PHP: _prof_php ----------
+# Install:  sudo pacman -S xdebug               # Arch
+#           sudo apt install php-xdebug         # Debian / Ubuntu (or php8.3-xdebug for a specific version)
+#           sudo dnf install php-pecl-xdebug    # Fedora
+# Xdebug must be loaded for the exact PHP binary you profile (check: php -m | grep -i xdebug).
+#   profx php -S localhost:5050 server.php        # until Ctrl+C
+#   profx -t 30 php -S localhost:5050 server.php  # 30s window (keep the load test shorter)
+#   profx php8.3 -S localhost:5050 server.php     # specific PHP binary
+# Raw cachegrind files are kept in prof_php_<ts>/ (open with kcachegrind / qcachegrind).
+
+# ---------- Java: _prof_java ----------
+# Install:  sudo pacman -S jdk-openjdk | sudo apt install default-jdk | sudo dnf install java-latest-openjdk-devel
+# Needs a JDK (not just a JRE), because the "jfr" tool ships with it. JDK 21+ gives the nicest report.
+#   profx java -jar app.jar                       # until Ctrl+C
+#   profx -t 30 java -jar app.jar --port 8080     # 30s window
+#   profx java Main.java                          # single-file source launch
+#   profx java -cp . Main
+
+# ---------- Rust: _prof_rust ----------
+# Install:  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh     (or: sudo pacman -S rustup)
+# Build first:  cargo build --release     (profile the binary, "cargo run" is not accepted)
+# Needs the PROF_REPORT + pprof + ctrlc code in the app's main.rs (see bottleneck-rs):
+# the app writes the report itself when it receives Ctrl+C / SIGINT.
+#   profx ./target/release/myserver               # until Ctrl+C
+#   profx -t 30 ./target/release/myserver         # 30s window
+#   profx ./target/release/myserver --port 8080   # extra args work too
+# A binary copied outside target/ is detected as C++, so use: profx -l rust ./myserver
+
+# ---------- C / C++: _prof_cpp ----------
+# Install:  # Arch / Manjaro / EndeavourOS
+#           sudo pacman -S gcc perf
+#           # Debian
+#           sudo apt install g++ linux-perf
+#           # Ubuntu
+#           sudo apt install g++ linux-tools-generic linux-tools-$(uname -r)
+#           # Fedora
+#           sudo dnf install gcc-c++ perf
+# Build with symbols for readable output:  g++ -O2 -g -fno-omit-frame-pointer server.cpp -o server
+# If perf is blocked:  cat /proc/sys/kernel/perf_event_paranoid   (needs <= 1)
+#   sudo sysctl kernel.perf_event_paranoid=1
+#   profx ./server                                # until Ctrl+C
+#   profx -t 30 ./server --port 8080              # 30s window, extra args work
+# Run the built binary directly, not through make/cmake/gdb/valgrind (they are rejected).
+profx() {
+  local lang="" tflag=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -t) tflag=(-t "$2"); shift 2 ;;
+      -l) lang="$2"; shift 2 ;;
+      *)  break ;;
+    esac
   done
 
-  kill -- -$pid 2>/dev/null
-  wait $pid 2>/dev/null
-  trap '' INT
-
-  if [ ${#chunks[@]} -eq 0 ]; then
-    trap - INT
-    echo "No profile collected" >&2
-    return 1
-  fi
-
-  ( trap '' INT
-    go tool pprof -proto "${chunks[@]}" > "$merged" 2>/dev/null
-    go tool pprof -top -nodecount=25 "$merged" > "$out" 2>&1 )
-  trap - INT
-  rm -f "${chunks[@]}"
-
-  echo "Report: $out   Raw profile: $merged"
-  echo "--- Top functions ---"
-  sed -n '1,18p' "$out"
-}
-
-# ---------- Python: prof_py [-t seconds] python server.py ----------
-#prof_py python server.py                    # no timer, press Ctrl+C once to finish
-#prof_py -t 30 python server.py              # stops by itself after 30s
-#prof_py python3 server.py --port 8000       # python3 and script args work
-#prof_py ./venv/bin/python server.py         # use a venv's interpreter
-prof_py() {
   if [ $# -eq 0 ]; then
-    echo "Usage: prof_py [-t seconds] python server.py [args...]   (default: run until Ctrl+C)" >&2
+    echo "Usage: profx [-t seconds] [-l node|go|py|php|java|rust|cpp] <command> [args...]" >&2
+    echo "  e.g. profx node server.js | profx -t 30 go run . | profx python3 app.py | profx php -S localhost:5050 s.php" >&2
+    echo "       profx java -jar app.jar | profx ./target/release/myserver | profx ./server" >&2
     return 1
   fi
 
-  local secs=0
-  if [ "$1" = "-t" ]; then secs="$2"; shift 2; fi
-
-  local cmd="$1"; shift
-  local ts; ts=$(date +%Y-%m-%d_%H-%M-%S)
-  local pb="prof_$ts.pstats"
-  local out="report_py_$ts.txt"
-
-  "$cmd" -m cProfile -o "$pb" "$@" &
-  local pid=$!
-
-  local stopped=0 elapsed=0
-  trap 'stopped=1' INT
-
-  if [ "$secs" -gt 0 ]; then
-    echo ">>> Profiling for ${secs}s. Start your load test NOW. Ctrl+C ends early."
-  else
-    echo ">>> Profiling until you press Ctrl+C once."
+  if [ -z "$lang" ]; then
+    case "${1##*/}" in
+      node|nodejs)               lang=node ;;
+      go)                        lang=go ;;
+      python|python[0-9]*|pypy*) lang=py ;;
+      php|php[0-9]*)             lang=php ;;
+      java)                      lang=java ;;
+      *)
+        # pre-built binary: Rust, Go or C/C++
+        if [[ "$1" == */target/release/* || "$1" == */target/debug/* ]]; then
+          lang=rust
+        elif command -v go >/dev/null && go version -m "$1" >/dev/null 2>&1; then
+          lang=go
+        else
+          lang=cpp
+        fi ;;
+    esac
   fi
 
-  while kill -0 $pid 2>/dev/null && [ $stopped -eq 0 ]; do
-    if [ "$secs" -gt 0 ] && [ $elapsed -ge "$secs" ]; then break; fi
-    sleep 1
-    elapsed=$((elapsed + 1))
-  done
-
-  kill -INT $pid 2>/dev/null
-  wait $pid 2>/dev/null
-  trap '' INT
-
-  if [ ! -s "$pb" ]; then
-    trap - INT
-    echo "No profile was generated" >&2
-    return 1
-  fi
-
-  ( trap '' INT
-    "$cmd" -c "import pstats,sys; pstats.Stats(sys.argv[1]).sort_stats('tottime').print_stats(25)" "$pb" > "$out" )
-  trap - INT
-
-  if [ -s "$out" ]; then
-    rm -f "$pb"
-    echo "Report: $out"
-    echo "--- Top functions (by tottime) ---"
-    grep -A 14 "ncalls" "$out"
-  else
-    echo "Report is empty, keeping $pb" >&2
-    return 1
-  fi
+  case "$lang" in
+    node|go|py|php|java|rust|cpp) "_prof_$lang" "${tflag[@]}" "$@" ;;
+    *) echo "Unknown language '$lang' (use node, go, py, php, java, rust or cpp)" >&2; return 1 ;;
+  esac
 }
-
-# ---------- Rust: prof_rust [-t seconds] cargo run --release | ./target/release/myserver ----------
-# Arch / Manjaro / EndeavourOS
-# sudo pacman -S perf
-#
-# # Debian / Ubuntu
-# sudo apt install linux-perf        # Debian
-# sudo apt install linux-tools-generic linux-tools-$(uname -r)   # Ubuntu
-#
-# # Fedora
-# sudo dnf install perf
-
-# ---------- Rust: prof_rust [-t seconds] ./target/release/myserver ----------
-#prof_rust ./target/release/bottleneck-rs            # no timer, press Ctrl+C once to finish
-#prof_rust -t 30 ./target/release/bottleneck-rs      # stops by itself after 30s (Ctrl+C ends early)
-#prof_rust ./target/release/myserver --port 8080     # extra args work too
-# Needs the PROF_REPORT + pprof + ctrlc code in the app's main.rs (see bottleneck-rs)
-prof_rust() {
-  if [ $# -eq 0 ]; then
-    echo "Usage: prof_rust [-t seconds] ./target/release/bin [args...]   (default: run until Ctrl+C)" >&2
-    return 1
-  fi
-
-  local secs=0
-  if [ "$1" = "-t" ]; then secs="$2"; shift 2; fi
-
-  if [ ! -x "$1" ]; then
-    echo "Not an executable: $1 (run cargo build --release first, and check your current folder)" >&2
-    return 1
-  fi
-
-  local ts; ts=$(date +%Y-%m-%d_%H-%M-%S)
-  local out="report_rust_$ts.txt"
-
-  if [ "$secs" -gt 0 ]; then
-    echo ">>> Profiling for ${secs}s. Start your load test NOW. Ctrl+C ends early."
-  else
-    echo ">>> Profiling until you press Ctrl+C once."
-  fi
-
-  # The function itself survives Ctrl+C; the app gets the signal, writes the report and exits
-  trap : INT
-  if [ "$secs" -gt 0 ]; then
-    PROF_REPORT="$out" timeout --foreground -s INT "$secs" "$@"
-  else
-    PROF_REPORT="$out" "$@"
-  fi
-  trap - INT
-
-  if [ -s "$out" ]; then
-    echo "Report: $out"
-    echo "--- Top functions (self time) ---"
-    sed -n '1,20p' "$out"
-  else
-    echo "No report was generated" >&2
-    return 1
-  fi
-}
-
-# ==============================================================================
-# SSH AGENT
-#     Starts a NEW agent in every shell. To reuse one agent instead, see the
-#     notes in the chat reply.
-# ==============================================================================
-
-#eval `ssh-agent -s`
-$ssh-add -k ~/.ssh/fd
