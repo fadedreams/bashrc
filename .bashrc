@@ -301,6 +301,34 @@ gitme() {
   echo "Source: $(git config --show-origin --get user.email | cut -f1)"
 }
 
+# gitssh https://github.com/fadedreams/chaos_eng_node_1.git
+# git@github.com:fadedreams/chaos_eng_node_1.git
+gitssh() {
+  # Convert HTTPS git URLs to SSH form.
+  #   gitssh <https-url>   -> prints the SSH URL
+  #   gitssh [remote]      -> converts that remote in the current repo (default: origin)
+  local conv='s#^https://([^@/]+@)?([^/]+)/(.+)$#git@\2:\3#'
+
+  if [[ "$1" == https://* ]]; then
+    sed -E "$conv" <<< "$1"
+    return
+  fi
+
+  local remote="${1:-origin}" url new
+  url=$(git remote get-url "$remote" 2>/dev/null) || {
+    echo "gitssh: no remote named '$remote'" >&2
+    return 1
+  }
+
+  if [[ "$url" != https://* ]]; then
+    echo "gitssh: '$remote' is already not HTTPS: $url"
+    return 0
+  fi
+
+  new=$(sed -E "$conv" <<< "$url")
+  git remote set-url "$remote" "$new" && echo "$remote: $url -> $new"
+}
+
 
 # ==============================================================================
 # CLIPBOARD: clip / clip_show
