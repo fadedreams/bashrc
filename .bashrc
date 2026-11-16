@@ -155,6 +155,146 @@ alias serve='python3 -m http.server 8000'
 alias cwd='pwd | tr -d "\n" | xclip -selection clipboard && echo "PWD copied: $(pwd)"'
 alias clast='fc -ln -1 | tr -d "\n" | xclip -selection clipboard && echo "Last command copied."'
 
+#!/usr/bin/env bash
+# io_monitor.sh - network & disk I/O helpers for performance testing.
+# Pure bash + awk, reads /proc directly (no sysstat needed).
+#
+# Usage:   source io_monitor.sh
+#   net_io [iface] [interval=1] [count=0]      live network throughput/errors (count 0 = forever)
+#   disk_io [device] [interval=1] [count=0]    live disk IOPS/throughput/await/queue/util
+#   net_retrans [interval=1] [count=0]         TCP retransmit rate
+#   sys_io_log [file] [iface] [dev] [interval] CSV log to correlate with test results
+#   io_top_procs                               which processes are doing the I/O
+#   io_snapshot [seconds=5]                    quick combined report
+# Ctrl+C stops any loop.
+
+_default_iface() {
+  local i
+  i=$(ip route show default 2>/dev/null | awk '{for(k=1;k<=NF;k++) if($k=="dev"){print $(k+1); exit}}')
+  [ -z "$i" ] && i=$(awk -F: 'NR>2 {gsub(/ /,"",$1); if($1!="lo"){print $1; exit}}' /proc/net/dev)
+  echo "$i"
+}
+
+_default_disk() {
+  local d
+  d=$(lsblk -ndo NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1; exit}')
+  [ -z "$d" ] && d=$(awk '$3 ~ /^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|nvme[0-9]+n[0-9]+)$/ {print $3; exit}' /proc/diskstats)
+  echo "$d"
+}
+
+# rx_bytes rx_pkts rx_errs rx_drop tx_bytes tx_pkts tx_errs tx_drop
+_net_snap()  { awk -v i="$1" '{sub(/:/," ")} $1==i {print $2,$3,$4,$5,$10,$11,$12,$13}' /proc/net/dev; }
+# reads sect_read ms_read writes sect_written ms_write io_ticks weighted_ms
+_disk_snap() { awk -v d="$1" '$3==d {print $4,$6,$7,$8,$10,$11,$13,$14}' /proc/diskstats; }
+# retrans_segs out_segs
+_tcp_snap()  { awk '/^Tcp:/ { if(!h){for(i=1;i<=NF;i++)n[$i]=i; h=1} else {print $n["RetransSegs"], $n["OutSegs"]} }' /proc/net/snmp; }
+
+_net_calc() {  # prev cur interval -> rx_Mbps tx_Mbps rx_pps tx_pps errs drops
+  awk -v p="$1" -v c="$2" -v t="$3" 'BEGIN{
+    split(p,a," "); split(c,b," ");
+    printf "%.2f %.2f %.0f %.0f %d %d",
+      (b[1]-a[1])*8/1e6/t, (b[5]-a[5])*8/1e6/t,
+      (b[2]-a[2])/t, (b[6]-a[6])/t,
+      (b[3]-a[3])+(b[7]-a[7]), (b[4]-a[4])+(b[8]-a[8]) }'
+}
+
+_disk_calc() {  # prev cur interval -> r/s w/s rMB/s wMB/s await aqu-sz util%
+  awk -v p="$1" -v c="$2" -v t="$3" 'BEGIN{
+    split(p,a," "); split(c,b," ");
+    dr=b[1]-a[1]; dw=b[4]-a[4]; ios=dr+dw;
+    await = (ios>0) ? ((b[3]-a[3])+(b[6]-a[6]))/ios : 0;
+    util  = (b[7]-a[7])/(t*1000)*100; if(util>100) util=100;
+    printf "%.0f %.0f %.2f %.2f %.2f %.2f %.1f",
+      dr/t, dw/t, (b[2]-a[2])*512/1048576/t, (b[5]-a[5])*512/1048576/t,
+      await, (b[8]-a[8])/(t*1000), util }'
+}
+
+net_io() {
+  local iface="${1:-$(_default_iface)}" interval="${2:-1}" count="${3:-0}" i=0 prev cur
+  prev=$(_net_snap "$iface")
+  [ -z "$prev" ] && { echo "net_io: interface '$iface' not found" >&2; return 1; }
+  echo "Interface: $iface  (interval ${interval}s)"
+  printf "%-9s %10s %10s %9s %9s %6s %6s\n" TIME RX_Mbps TX_Mbps RX_pps TX_pps ERRS DROPS
+  while :; do
+    sleep "$interval"
+    cur=$(_net_snap "$iface")
+    # shellcheck disable=SC2046
+    printf "%-9s %10s %10s %9s %9s %6s %6s\n" "$(date +%T)" $(_net_calc "$prev" "$cur" "$interval")
+    prev=$cur; i=$((i+1))
+    [ "$count" -gt 0 ] && [ "$i" -ge "$count" ] && break
+  done
+}
+
+disk_io() {
+  local dev="${1:-$(_default_disk)}" interval="${2:-1}" count="${3:-0}" i=0 prev cur
+  dev="${dev#/dev/}"
+  prev=$(_disk_snap "$dev")
+  [ -z "$prev" ] && { echo "disk_io: device '$dev' not found in /proc/diskstats" >&2; return 1; }
+  echo "Device: $dev  (interval ${interval}s)"
+  printf "%-9s %8s %8s %9s %9s %9s %8s %6s\n" TIME r/s w/s rMB/s wMB/s await_ms aqu-sz util%
+  while :; do
+    sleep "$interval"
+    cur=$(_disk_snap "$dev")
+    # shellcheck disable=SC2046
+    printf "%-9s %8s %8s %9s %9s %9s %8s %6s\n" "$(date +%T)" $(_disk_calc "$prev" "$cur" "$interval")
+    prev=$cur; i=$((i+1))
+    [ "$count" -gt 0 ] && [ "$i" -ge "$count" ] && break
+  done
+}
+
+net_retrans() {
+  local interval="${1:-1}" count="${2:-0}" i=0 prev cur
+  prev=$(_tcp_snap)
+  printf "%-9s %12s %12s %9s\n" TIME RETRANS/s OUTSEGS/s RETRANS%
+  while :; do
+    sleep "$interval"
+    cur=$(_tcp_snap)
+    awk -v p="$prev" -v c="$cur" -v t="$interval" -v ts="$(date +%T)" 'BEGIN{
+      split(p,a," "); split(c,b," ");
+      r=b[1]-a[1]; o=b[2]-a[2];
+      printf "%-9s %12.1f %12.1f %8.2f%%\n", ts, r/t, o/t, (o>0)?r/o*100:0 }'
+    prev=$cur; i=$((i+1))
+    [ "$count" -gt 0 ] && [ "$i" -ge "$count" ] && break
+  done
+}
+
+# CSV log: run in background during a load test, then plot next to response times.
+#   sys_io_log io.csv & ; ...run test... ; kill %1
+sys_io_log() {
+  local file="${1:-io_log.csv}" iface="${2:-$(_default_iface)}" dev="${3:-$(_default_disk)}" interval="${4:-1}"
+  local pn cn pd cd
+  dev="${dev#/dev/}"
+  echo "timestamp,rx_mbps,tx_mbps,rx_pps,tx_pps,net_errs,net_drops,r_s,w_s,rMB_s,wMB_s,await_ms,aqu_sz,util_pct" > "$file"
+  pn=$(_net_snap "$iface"); pd=$(_disk_snap "$dev")
+  while :; do
+    sleep "$interval"
+    cn=$(_net_snap "$iface"); cd=$(_disk_snap "$dev")
+    echo "$(date +%FT%T),$(_net_calc "$pn" "$cn" "$interval" | tr ' ' ','),$(_disk_calc "$pd" "$cd" "$interval" | tr ' ' ',')" >> "$file"
+    pn=$cn; pd=$cd
+  done
+}
+
+io_top_procs() {
+  if command -v pidstat >/dev/null 2>&1; then
+    echo "== Disk I/O per process (pidstat) =="; pidstat -d 1 3
+  elif command -v iotop >/dev/null 2>&1; then
+    echo "== Disk I/O per process (iotop) =="; sudo iotop -obn 3
+  else
+    echo "Install sysstat (pidstat) or iotop for per-process disk I/O."
+  fi
+  if command -v nethogs >/dev/null 2>&1; then
+    echo "== Network per process (nethogs) =="; sudo nethogs -t -c 3
+  else
+    echo "Install nethogs for per-process network usage."
+  fi
+}
+
+io_snapshot() {
+  local secs="${1:-5}"
+  echo "### Network ###";        net_io "" 1 "$secs"
+  echo; echo "### TCP retransmits ###"; net_retrans 1 "$secs"
+  echo; echo "### Disk ###";     disk_io "" 1 "$secs"
+}
 
 # ==============================================================================
 # FILE PERMISSIONS & GROUPS
